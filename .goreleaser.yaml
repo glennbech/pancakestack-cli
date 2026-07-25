@@ -1,0 +1,73 @@
+version: 2
+
+project_name: pancakestack
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: pancakestack
+    main: ./cmd/pancakestack
+    binary: pancakestack
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goos: windows
+        goarch: arm64
+    ldflags:
+      - -s -w
+      - -X main.Version={{.Version}}
+
+archives:
+  - id: pancakestack
+    formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^chore:"
+      - "^ci:"
+      - "^test:"
+
+release:
+  github:
+    owner: glennbech
+    name: pancakestack-cli
+  draft: false
+  prerelease: auto
+
+# Homebrew tap — auto-updates a formula in glennbech/homebrew-tap on each
+# release. Repo must exist and the release workflow's GITHUB_TOKEN needs
+# write access to it (typically via a PAT stored as HOMEBREW_TAP_TOKEN).
+# Commented out until you create the tap repo.
+# brews:
+#   - repository:
+#       owner: glennbech
+#       name: homebrew-tap
+#       token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+#     directory: Formula
+#     homepage: https://github.com/glennbech/pancakestack-cli
+#     description: "Cloud astro-stacking CLI"
+#     license: MIT
+#     test: |
+#       system "#{bin}/pancakestack", "--version"

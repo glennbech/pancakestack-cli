@@ -1,0 +1,14 @@
+# Go build artifacts
+/pancakestack
+/bin/
+dist/
+
+# IDE
+.idea/
+.vscode/
+
+# macOS
+.DS_Store
+
+# Local envs
+.env
