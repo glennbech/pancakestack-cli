@@ -1,9 +1,9 @@
 # pancakestack
 
-Cloud astrophotography stacking on AWS EC2 spot instances. Command-line client.
+Stack your astro photos in the cloud. Your laptop stays cool.
 
-Upload a tar of your light frames, kick off a stack, get a `result.fit` back.
-Auth is Google via AWS Cognito.
+Point it at a folder of light frames, kick off a stack, and get a `result.fit`
+back when it's done. You take the photos; pancakestack does the heavy lifting.
 
 ## Install
 

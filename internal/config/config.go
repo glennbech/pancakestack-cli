@@ -8,7 +8,7 @@ import (
 
 // DefaultBackendURL is baked at build time via -ldflags.
 // Override at runtime with --url or PANCAKESTACK_URL.
-var DefaultBackendURL = "https://3txoplwyf2nosohpd4vdr5xaqy0dgrjo.lambda-url.us-east-1.on.aws"
+var DefaultBackendURL = "https://kjvlw4gb6ksxsypgr6x6jsqkl40ntoke.lambda-url.us-east-1.on.aws"
 
 // BackendURL returns the resolved backend URL — flag > env > compiled default.
 // flagValue is the value of --url; pass "" if unset.

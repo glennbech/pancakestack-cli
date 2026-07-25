@@ -18,8 +18,8 @@ var backendURL string
 func main() {
 	root := &cobra.Command{
 		Use:     "pancakestack",
-		Short:   "Cloud astro-stacking on AWS EC2 spot",
-		Long:    "pancakestack — upload light frames, run Siril on cloud spot instances, get a stacked FITS back.",
+		Short:   "Stack your astro photos in the cloud",
+		Long:    "pancakestack — point it at a folder of light frames, wait a bit, get a stacked FITS back.",
 		Version: Version,
 	}
 	root.PersistentFlags().StringVar(&backendURL, "url", "", "Backend URL (overrides PANCAKESTACK_URL and compiled default)")

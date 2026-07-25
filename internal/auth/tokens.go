@@ -20,9 +20,9 @@ type Tokens struct {
 
 	// Discovery values captured at login time so refresh works without
 	// re-hitting /login.
-	Issuer       string `json:"issuer"`
-	ClientID     string `json:"client_id"`
-	TokenURL     string `json:"token_url"`
+	Issuer   string `json:"issuer"`
+	ClientID string `json:"client_id"`
+	TokenURL string `json:"token_url"`
 }
 
 // Load reads tokens from path. Returns (nil, nil) if the file doesn't exist —
