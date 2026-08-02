@@ -290,17 +290,6 @@ func hashFile(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// hashReaderAt streams a *os.File (or any io.ReaderAt with a known size)
-// through SHA-256. Used by the archive path where the data source is
-// already a *os.File we opened for the multipart upload.
-func hashReaderAt(r io.ReaderAt, size int64) (string, error) {
-	h := sha256.New()
-	if _, err := io.Copy(h, io.NewSectionReader(r, 0, size)); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
-}
-
 // runArchiveUpload is the legacy single-archive path — kept because a
 // user with an existing tar (or a directory to tar) shouldn't be forced
 // to expand it locally first.
@@ -342,12 +331,10 @@ func runArchiveUpload(ctx context.Context, client *api.Client, collectionID, pat
 		data = tmp
 	}
 
-	fmt.Fprintf(os.Stderr, "Hashing archive (SHA-256, %.1f MB)...\n", mib(length))
-	sum, err := hashReaderAt(data, length)
-	if err != nil {
-		return fmt.Errorf("hash archive: %w", err)
-	}
-
+	// Skip client-side dedup for archive uploads. Tar/zip output rarely
+	// hashes identically across runs (mtimes, file ordering), so the
+	// SHA-256 is ~pure overhead — for a 38 GB tar it's 5+ min of CPU
+	// just to send a value the backend won't dedup on.
 	fmt.Fprintf(os.Stderr, "Uploading %.1f MB to S3 (multipart, archive %s)...\n",
 		mib(length), archiveName)
 	started := time.Now()
@@ -357,7 +344,6 @@ func runArchiveUpload(ctx context.Context, client *api.Client, collectionID, pat
 		Filename:     archiveName,
 		Data:         data,
 		Size:         length,
-		SHA256:       sum,
 		OnProgress:   progress.update,
 	})
 	if err != nil {

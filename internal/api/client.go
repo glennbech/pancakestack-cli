@@ -69,12 +69,13 @@ type multipartInitReq struct {
 	CollectionID string `json:"collectionId"`
 	Filename     string `json:"filename"`
 	ContentType  string `json:"contentType,omitempty"`
-	SHA256       string `json:"sha256"`
+	SHA256       string `json:"sha256,omitempty"`
 }
 
 // InitMultipartUpload starts a multipart upload for the given collection archive.
-// sha256 is the lowercase-hex SHA-256 of the file; backend uses it to reject
-// duplicates before we spend bandwidth on parts.
+// sha256 is the lowercase-hex SHA-256 of the file, or empty to skip client-side
+// dedup. Pass a hash for the per-file path where dedup is worth the cost; skip
+// it for opaque archives where re-tar rarely produces byte-identical output.
 func (c *Client) InitMultipartUpload(ctx context.Context, collectionID, filename, contentType, sha256 string) (*MultipartInitResp, error) {
 	var resp MultipartInitResp
 	body := multipartInitReq{CollectionID: collectionID, Filename: filename, ContentType: contentType, SHA256: sha256}
@@ -702,8 +703,10 @@ type MultipartUploadOptions struct {
 	ContentType  string
 	Data         io.ReaderAt
 	Size         int64
-	// SHA256 of the file contents (lowercase hex). Required — backend
-	// dedup rejects the init before we start streaming parts.
+	// SHA256 of the file contents (lowercase hex). Optional — pass empty
+	// to skip client-side dedup. Worth setting for stable per-file uploads
+	// where the backend can short-circuit a re-upload; not worth the CPU
+	// cost for large opaque archives that hash uniquely each time anyway.
 	SHA256      string
 	Concurrency int
 	// OnProgress fires whenever a part finishes; may be called from many goroutines.
