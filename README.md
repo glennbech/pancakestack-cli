@@ -11,7 +11,7 @@ Pick one:
 
 ```bash
 # Homebrew (macOS + Linux)
-brew install glennbech/tap/pancakestack
+brew install --cask glennbech/tap/pancakestack
 
 # Or download a release binary (macOS / Linux, amd64 or arm64)
 os=$(uname -s | tr '[:upper:]' '[:lower:]')
@@ -22,6 +22,19 @@ curl -sSL "https://github.com/glennbech/pancakestack-cli/releases/latest/downloa
 # Or if you have Go
 go install github.com/glennbech/pancakestack-cli/cmd/pancakestack@latest
 ```
+
+### macOS: unsigned binary
+
+The release binary isn't (yet) codesigned + notarized, so Gatekeeper will
+block it on first run — you'll see a "cannot be opened" dialog. After a
+`brew install --cask`, clear the quarantine bit:
+
+```bash
+xattr -cr "$(brew --prefix)/Caskroom/pancakestack"
+```
+
+The `curl` install above is unaffected — piping to `tar` doesn't set the
+quarantine attribute.
 
 ## Quickstart
 
