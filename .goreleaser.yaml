@@ -56,18 +56,18 @@ release:
   draft: false
   prerelease: auto
 
-# Homebrew tap — auto-updates a formula in glennbech/homebrew-tap on each
-# release. Repo must exist and the release workflow's GITHUB_TOKEN needs
-# write access to it (typically via a PAT stored as HOMEBREW_TAP_TOKEN).
-# Commented out until you create the tap repo.
-# brews:
-#   - repository:
-#       owner: glennbech
-#       name: homebrew-tap
-#       token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
-#     directory: Formula
-#     homepage: https://github.com/glennbech/pancakestack-cli
-#     description: "Cloud astro-stacking CLI"
-#     license: MIT
-#     test: |
-#       system "#{bin}/pancakestack", "--version"
+# Homebrew tap — goreleaser writes Casks/pancakestack.rb into
+# glennbech/homebrew-tap on each release. Needs a PAT in HOMEBREW_TAP_TOKEN
+# with write access to that repo (the default GITHUB_TOKEN can only write
+# to the current repo). goreleaser v2 deprecated `brews` in favor of
+# `homebrew_casks` — casks now cover pre-built CLI binaries too.
+homebrew_casks:
+  - name: pancakestack
+    repository:
+      owner: glennbech
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    directory: Casks
+    homepage: https://github.com/glennbech/pancakestack-cli
+    description: "Stack your astro photos in the cloud"
+    license: MIT

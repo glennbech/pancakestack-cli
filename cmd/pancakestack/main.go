@@ -29,6 +29,8 @@ func main() {
 	root.AddCommand(newWhoamiCmd())
 	root.AddCommand(newUploadCmd())
 	root.AddCommand(newStackCmd())
+	root.AddCommand(newJobsCmd())
+	root.AddCommand(newLogsCmd())
 
 	if err := root.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)

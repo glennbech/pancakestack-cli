@@ -1,7 +1,11 @@
 # Go build artifacts
 /pancakestack
+/flip
 /bin/
 dist/
+
+# Test / scratch data
+/Archive.zip
 
 # IDE
 .idea/

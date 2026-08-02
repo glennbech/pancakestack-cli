@@ -13,8 +13,11 @@ Pick one:
 # Homebrew (macOS + Linux)
 brew install glennbech/tap/pancakestack
 
-# Or download a release binary
-curl -sSL https://github.com/glennbech/pancakestack-cli/releases/latest/download/pancakestack_$(uname -s)_$(uname -m).tar.gz | tar xz -C /usr/local/bin pancakestack
+# Or download a release binary (macOS / Linux, amd64 or arm64)
+os=$(uname -s | tr '[:upper:]' '[:lower:]')
+arch=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+curl -sSL "https://github.com/glennbech/pancakestack-cli/releases/latest/download/pancakestack_${os}_${arch}.tar.gz" \
+  | tar xz pancakestack && sudo mv pancakestack /usr/local/bin/
 
 # Or if you have Go
 go install github.com/glennbech/pancakestack-cli/cmd/pancakestack@latest
