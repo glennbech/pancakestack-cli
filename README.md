@@ -7,32 +7,47 @@ back when it's done. You take the photos; pancakestack does the heavy lifting.
 
 ## Install
 
-Pick one:
+### macOS
 
 ```bash
-# Homebrew (macOS + Linux)
+# Homebrew (auto-detects Apple Silicon vs Intel)
 brew install --cask glennbech/tap/pancakestack
+xattr -cr "$(brew --prefix)/Caskroom/pancakestack"   # clear Gatekeeper quarantine (unsigned binary)
 
-# Or download a release binary (macOS / Linux, amd64 or arm64)
-# — one paste; auto-detects os + arch:
-curl -sSL "https://github.com/glennbech/pancakestack-cli/releases/latest/download/pancakestack_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz pancakestack && sudo mv pancakestack /usr/local/bin/
+# — or plain curl (no quarantine dance):
+curl -sSL "https://github.com/glennbech/pancakestack-cli/releases/latest/download/pancakestack_darwin_$(uname -m | sed 's/x86_64/amd64/').tar.gz" | tar xz pancakestack && sudo mv pancakestack /usr/local/bin/
+```
 
-# Or if you have Go
+The release binary isn't codesigned+notarized yet, so the Homebrew cask
+needs the `xattr` step. The `curl` path pipes through `tar` and never
+sets the quarantine attribute, so it works out of the box.
+
+### Linux (amd64 or arm64)
+
+Homebrew casks are macOS-only, so on Linux use curl:
+
+```bash
+curl -sSL "https://github.com/glennbech/pancakestack-cli/releases/latest/download/pancakestack_linux_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz pancakestack && sudo mv pancakestack /usr/local/bin/
+```
+
+### Windows (PowerShell, amd64)
+
+```powershell
+$dir = "$env:LOCALAPPDATA\Programs\pancakestack"
+New-Item -ItemType Directory -Force -Path $dir | Out-Null
+Invoke-WebRequest -Uri "https://github.com/glennbech/pancakestack-cli/releases/latest/download/pancakestack_windows_amd64.zip" -OutFile "$dir\pancakestack.zip"
+Expand-Archive -Force "$dir\pancakestack.zip" -DestinationPath $dir
+```
+
+Then add `%LOCALAPPDATA%\Programs\pancakestack` to your `PATH` (one-time,
+via *Settings → System → About → Advanced system settings → Environment
+Variables*), open a fresh terminal, and `pancakestack --version` should work.
+
+### From source
+
+```bash
 go install github.com/glennbech/pancakestack-cli/cmd/pancakestack@latest
 ```
-
-### macOS: unsigned binary
-
-The release binary isn't (yet) codesigned + notarized, so Gatekeeper will
-block it on first run — you'll see a "cannot be opened" dialog. After a
-`brew install --cask`, clear the quarantine bit:
-
-```bash
-xattr -cr "$(brew --prefix)/Caskroom/pancakestack"
-```
-
-The `curl` install above is unaffected — piping to `tar` doesn't set the
-quarantine attribute.
 
 ## Quickstart
 
