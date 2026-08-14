@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -20,6 +21,12 @@ import (
 	"github.com/glennbech/pancakestack-cli/internal/auth"
 	"github.com/glennbech/pancakestack-cli/internal/config"
 )
+
+// ErrNotActivated is returned when the backend rejects a call because the
+// authenticated user has not redeemed an invite code yet (HTTP 403 with
+// code=UNAPPROVED). The CLI's main() surfaces this as a fixed one-line
+// message rather than the raw backend error.
+var ErrNotActivated = errors.New("please activate your account in a web browser before using the cli")
 
 // Client talks to a pancakestack backend. Wraps http.Client with bearer-token
 // injection and one-shot token refresh on 401.
@@ -346,6 +353,9 @@ func (c *Client) postJSON(ctx context.Context, path string, body any, out any) e
 
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(resp.Body)
+		if isUnapproved(resp.StatusCode, body) {
+			return ErrNotActivated
+		}
 		return fmt.Errorf("%s returned %d: %s", path, resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
@@ -399,9 +409,27 @@ func (c *Client) getJSON(ctx context.Context, path string, query map[string]stri
 
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(resp.Body)
+		if isUnapproved(resp.StatusCode, body) {
+			return ErrNotActivated
+		}
 		return fmt.Errorf("%s returned %d: %s", path, resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+// isUnapproved reports whether a backend response is the "invite not yet
+// redeemed" gate — HTTP 403 with a JSON body carrying code=UNAPPROVED.
+func isUnapproved(status int, body []byte) bool {
+	if status != http.StatusForbidden {
+		return false
+	}
+	var e struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(body, &e); err != nil {
+		return false
+	}
+	return e.Code == "UNAPPROVED"
 }
 
 // ensureFreshTokens refreshes tokens proactively if they're near expiry.
@@ -842,4 +870,259 @@ func putPresignedPart(ctx context.Context, presignedURL string, body io.Reader, 
 		return "", fmt.Errorf("S3 did not return an ETag")
 	}
 	return strings.Trim(etag, `"`), nil
+}
+
+// ---- Bulk download presign ----
+//
+// Symmetric with /upload/presign: caller supplies filenames, backend
+// returns one presigned single-GET URL per file. Client streams downloads
+// with concurrency. Names come from ListCollectionFiles (which also
+// carries sizes for progress + resume).
+
+// CollectionFile is the trimmed subset of the backend's collectionFile
+// wire shape that the CLI needs for listing + download reconciliation.
+// The full shape has ~50 FITS-metadata fields the CLI doesn't consume.
+type CollectionFile struct {
+	Name         string `json:"name"`
+	SizeBytes    int64  `json:"sizeBytes"`
+	LastModified string `json:"lastModified"`
+	Kind         string `json:"kind"`
+}
+
+type listCollectionFilesResp struct {
+	Files     []CollectionFile `json:"files"`
+	NextToken string           `json:"nextToken,omitempty"`
+	Source    string           `json:"source"`
+}
+
+// ListCollectionFiles walks every page of GET /collections/{id}/files and
+// returns the aggregated list. Backend caps pageSize at 1000; we let it
+// pick the default (currently 500) and follow nextToken until exhausted.
+func (c *Client) ListCollectionFiles(ctx context.Context, collectionID string) ([]CollectionFile, error) {
+	var all []CollectionFile
+	nextToken := ""
+	for {
+		q := map[string]string{}
+		if nextToken != "" {
+			q["nextToken"] = nextToken
+		}
+		var page listCollectionFilesResp
+		if err := c.getJSON(ctx, "/collections/"+collectionID+"/files", q, &page); err != nil {
+			return nil, err
+		}
+		all = append(all, page.Files...)
+		if page.NextToken == "" {
+			break
+		}
+		nextToken = page.NextToken
+	}
+	return all, nil
+}
+
+type presignDownloadReq struct {
+	Names []string `json:"names"`
+}
+
+// PresignedDownload is one signed GET URL from PresignDownloadBulk.
+type PresignedDownload struct {
+	Name      string `json:"name"`
+	Key       string `json:"key"`
+	URL       string `json:"url"`
+	ExpiresIn int    `json:"expiresIn"`
+}
+
+type presignDownloadResp struct {
+	Files []PresignedDownload `json:"files"`
+}
+
+// PresignDownloadBulk asks the backend to sign single-GET URLs for up to
+// 500 filenames at once. Chunk client-side above 500.
+func (c *Client) PresignDownloadBulk(ctx context.Context, collectionID string, names []string) ([]PresignedDownload, error) {
+	var resp presignDownloadResp
+	if err := c.postJSON(ctx, "/collections/"+collectionID+"/download/presign",
+		presignDownloadReq{Names: names}, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Files, nil
+}
+
+// BulkDownloadOptions drives DownloadFilesBulk.
+type BulkDownloadOptions struct {
+	CollectionID string
+	// Files are what to download — name + expected size. Size is used to
+	// skip files already present locally (same size = assume same content;
+	// good enough for FITS which are effectively immutable once captured).
+	Files []CollectionFile
+	// DestDir is the local directory to write into. Created if absent.
+	DestDir string
+	// Concurrency in-flight GETs. Default 4.
+	Concurrency int
+	// SkipExisting=true skips writing a file if a same-size local file
+	// exists at DestDir/name. Default true — callers rarely want to re-
+	// download on a resume.
+	SkipExisting bool
+	// OnFileDone fires once per file that finishes (download OR skip).
+	// May be called from many goroutines.
+	OnFileDone func(name string, sizeBytes int64, skipped bool, done, total int)
+	// OnFileError fires when a file fails. Download continues; the error
+	// is aggregated into the per-file result.
+	OnFileError func(name string, err error)
+}
+
+// BulkDownloadResult reports per-file outcome. Successful downloads have
+// Error == nil. Skipped=true means the file was already on disk at the
+// expected size; no GET was attempted.
+type BulkDownloadResult struct {
+	Name    string
+	Path    string
+	Skipped bool
+	Error   error
+}
+
+// presignDownloadChunkSize matches backend cap.
+const presignDownloadChunkSize = 500
+
+// DownloadFilesBulk downloads N collection files to DestDir. Uses
+// /collections/{id}/download/presign for URLs (batches of 500), then
+// plain HTTP GETs with the requested concurrency. Returns per-file
+// results — some can succeed while others fail; caller summarizes.
+//
+// Resumable: SkipExisting=true (the default) skips files whose local
+// size matches the collection metadata. Kill and re-run to pick up
+// where a prior invocation stopped.
+func (c *Client) DownloadFilesBulk(ctx context.Context, opts BulkDownloadOptions) ([]BulkDownloadResult, error) {
+	if len(opts.Files) == 0 {
+		return nil, fmt.Errorf("Files required")
+	}
+	if opts.DestDir == "" {
+		return nil, fmt.Errorf("DestDir required")
+	}
+	if err := os.MkdirAll(opts.DestDir, 0o755); err != nil {
+		return nil, fmt.Errorf("mkdir %s: %w", opts.DestDir, err)
+	}
+	concurrency := opts.Concurrency
+	if concurrency < 1 {
+		concurrency = 4
+	}
+	// SkipExisting defaults on — callers opt out by passing an explicit
+	// false via a separate flag if we ever need it.
+	skipExisting := opts.SkipExisting
+
+	total := len(opts.Files)
+	results := make([]BulkDownloadResult, total)
+	byName := make(map[string]int, total)
+	for i, f := range opts.Files {
+		byName[f.Name] = i
+	}
+
+	// Partition into (skip-locally-present, need-to-download). Skips
+	// count toward "done" so the progress totals reconcile.
+	var toFetch []string
+	var doneCount int64
+	for i, f := range opts.Files {
+		dst := filepath.Join(opts.DestDir, f.Name)
+		if skipExisting {
+			if info, err := os.Stat(dst); err == nil && !info.IsDir() && info.Size() == f.SizeBytes {
+				results[i] = BulkDownloadResult{Name: f.Name, Path: dst, Skipped: true}
+				n := atomic.AddInt64(&doneCount, 1)
+				if opts.OnFileDone != nil {
+					opts.OnFileDone(f.Name, f.SizeBytes, true, int(n), total)
+				}
+				continue
+			}
+		}
+		toFetch = append(toFetch, f.Name)
+	}
+
+	// Presign every remaining file upfront in batches of 500. Simpler
+	// than pipelining and finishes in seconds even for thousands of files.
+	presigned := make([]PresignedDownload, 0, len(toFetch))
+	for start := 0; start < len(toFetch); start += presignDownloadChunkSize {
+		end := start + presignDownloadChunkSize
+		if end > len(toFetch) {
+			end = len(toFetch)
+		}
+		batch, err := c.PresignDownloadBulk(ctx, opts.CollectionID, toFetch[start:end])
+		if err != nil {
+			return results, fmt.Errorf("presign batch [%d..%d]: %w", start, end, err)
+		}
+		presigned = append(presigned, batch...)
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+	for _, pd := range presigned {
+		i, ok := byName[pd.Name]
+		if !ok {
+			continue // shouldn't happen — backend echoes our names
+		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, pd PresignedDownload) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if ctx.Err() != nil {
+				results[i] = BulkDownloadResult{Name: pd.Name, Error: ctx.Err()}
+				return
+			}
+			dst := filepath.Join(opts.DestDir, pd.Name)
+			if err := getPresignedObject(ctx, pd.URL, dst); err != nil {
+				results[i] = BulkDownloadResult{Name: pd.Name, Path: dst, Error: err}
+				if opts.OnFileError != nil {
+					opts.OnFileError(pd.Name, err)
+				}
+				return
+			}
+			results[i] = BulkDownloadResult{Name: pd.Name, Path: dst}
+			n := atomic.AddInt64(&doneCount, 1)
+			if opts.OnFileDone != nil {
+				opts.OnFileDone(pd.Name, opts.Files[i].SizeBytes, false, int(n), total)
+			}
+		}(i, pd)
+	}
+	wg.Wait()
+	return results, nil
+}
+
+// getPresignedObject GETs a presigned URL and writes the body to dstPath
+// via a .part sidecar → rename dance so a killed process never leaves a
+// truncated file at the final name (which SkipExisting would then treat
+// as present-but-wrong-size on resume — mostly benign, but a rename is
+// cheaper than debugging that ambiguity).
+func getPresignedObject(ctx context.Context, presignedURL, dstPath string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, presignedURL, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := (&http.Client{}).Do(req)
+	if err != nil {
+		return fmt.Errorf("GET from S3: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("S3 returned %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	tmp := dstPath + ".part"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return fmt.Errorf("create %s: %w", tmp, err)
+	}
+	if _, err := io.Copy(f, resp.Body); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return fmt.Errorf("write %s: %w", tmp, err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("close %s: %w", tmp, err)
+	}
+	if err := os.Rename(tmp, dstPath); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("rename %s → %s: %w", tmp, dstPath, err)
+	}
+	return nil
 }
