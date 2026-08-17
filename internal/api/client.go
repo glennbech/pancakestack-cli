@@ -149,12 +149,20 @@ func (c *Client) CompleteMultipartUpload(ctx context.Context, uploadID, key stri
 }
 
 // StackRequest is the body of POST /jobs. The job runs against the whole
-// collection prefix — no per-file naming needed on this call.
+// collection prefix by default — optional IncludeFiles narrows it to
+// a specific filename allowlist (same list the webapp's Filter Frames
+// flow sends). Useful for stacking a subset without deleting the rest.
+//
+// InstanceType is an admin-privileged override. Under frame-based pricing
+// the backend picks the compute tier from the workload shape (frame count +
+// drizzle), same as the SaaS webapp does; non-admin overrides are rejected
+// server-side. Leave empty to let the backend pick.
 type StackRequest struct {
 	CollectionID string         `json:"collectionId"`
 	ScriptID     string         `json:"scriptId,omitempty"`
 	Params       map[string]any `json:"params,omitempty"`
 	InstanceType string         `json:"instanceType,omitempty"`
+	IncludeFiles []string       `json:"includeFiles,omitempty"`
 }
 
 // StackResponse is what POST /jobs returns.
@@ -244,6 +252,48 @@ func (c *Client) GetJob(ctx context.Context, jobID string) (*JobDetail, error) {
 	return &resp, nil
 }
 
+// CancelJob posts to /jobs/{id}/cancel — flips state to cancelled and
+// terminates the EC2 instance (if any is still running). Idempotent from
+// the server's POV: cancelling a terminal-state job is a no-op with a
+// message in the response body.
+func (c *Client) CancelJob(ctx context.Context, jobID string) error {
+	// Discard the response body — server returns a small JSON acknowledgement
+	// but the caller only cares about success/failure.
+	var discard map[string]any
+	return c.postJSON(ctx, "/jobs/"+jobID+"/cancel", struct{}{}, &discard)
+}
+
+// MetricPoint is one time/value sample from GET /jobs/{id}/metrics.
+type MetricPoint struct {
+	T string  `json:"t"`
+	V float64 `json:"v"`
+}
+
+// JobMetrics mirrors the backend's metricsResp in lambda-start-job/metrics.go.
+// Series keys today: cpuPct, memPct, netInBps, netOutBps, ebsReadBps,
+// ebsWriteBps. Empty series arrays are normal for a job in its first ~60s
+// (CWA publishes at 1-min intervals).
+type JobMetrics struct {
+	InstanceID    string                   `json:"instanceId"`
+	StartTime     string                   `json:"startTime"`
+	EndTime       string                   `json:"endTime"`
+	PeriodSeconds int                      `json:"periodSeconds"`
+	Series        map[string][]MetricPoint `json:"series"`
+	Note          string                   `json:"note,omitempty"`
+}
+
+// GetJobMetrics fetches the CloudWatch time-series panel for a job's
+// instance. Doubles as a smoke-test surface for the /jobs/{id}/metrics
+// endpoint — hit it after any Lambda deploy that touches auth or the CW
+// integration to catch IAM regressions before the browser does.
+func (c *Client) GetJobMetrics(ctx context.Context, jobID string) (*JobMetrics, error) {
+	var resp JobMetrics
+	if err := c.getJSON(ctx, "/jobs/"+jobID+"/metrics", nil, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
 // LogEvent is one CloudWatch entry from GET /logs/{jobId}.
 type LogEvent struct {
 	Timestamp int64  `json:"timestamp"`
@@ -278,6 +328,65 @@ type LogsQuery struct {
 	StartTime     int64
 	EndTime       int64
 	StartFromHead *bool
+}
+
+// AskRequest is the body of POST / on the RAG lambda's function URL.
+type AskRequest struct {
+	Query string `json:"query"`
+	K     int    `json:"k,omitempty"`
+}
+
+// AskCitation mirrors the RAG lambda's askCitation.
+type AskCitation struct {
+	ID         string  `json:"id"`
+	Kind       string  `json:"kind"`
+	Chapter    string  `json:"chapter,omitempty"`
+	Section    string  `json:"section,omitempty"`
+	RRF        float32 `json:"rrf"`
+	DenseRank  int     `json:"denseRank,omitempty"`
+	SparseRank int     `json:"sparseRank,omitempty"`
+}
+
+// AskResponse mirrors the RAG lambda's askResponse.
+type AskResponse struct {
+	Answer    string        `json:"answer"`
+	Citations []AskCitation `json:"citations"`
+	ElapsedMs int64         `json:"elapsedMs"`
+}
+
+// Ask calls the RAG lambda directly at its own function URL — separate
+// endpoint from the primary backend because the RAG lambda lives at a
+// dedicated Lambda URL (not routed through api.pancakestack.net).
+// Reuses this client's token machinery (refresh + bearer header) so the
+// caller doesn't reimplement auth.
+func (c *Client) Ask(ctx context.Context, ragURL string, req AskRequest) (*AskResponse, error) {
+	bodyBytes, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("marshal ask: %w", err)
+	}
+	if err := c.ensureFreshTokens(ctx); err != nil {
+		return nil, err
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, ragURL, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+c.Tokens.IDToken)
+	resp, err := c.http.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("POST %s: %w", ragURL, err)
+	}
+	defer resp.Body.Close()
+	buf, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("ask returned %d: %s", resp.StatusCode, string(buf))
+	}
+	var out AskResponse
+	if err := json.Unmarshal(buf, &out); err != nil {
+		return nil, fmt.Errorf("decode ask response: %w (body: %s)", err, string(buf))
+	}
+	return &out, nil
 }
 
 // GetLogs fetches a page of CloudWatch log events for the given job.

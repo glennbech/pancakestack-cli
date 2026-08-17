@@ -21,21 +21,34 @@ import (
 )
 
 // archiveNameFor picks the S3 basename we'll ask the backend to presign.
-// If we tarred a directory ourselves, it's always `lights.tar`. If the user
-// passed a pre-built archive, preserve its extension so `stack` (and the
-// EC2 extractor) route to the right unpacker.
-func archiveNameFor(path string, isPreBuilt bool) string {
-	if !isPreBuilt {
-		return "lights.tar"
+// Preserves whatever name the user actually gave us so the S3 object,
+// error messages, and pending-uploads UI card all show something the user
+// recognises — not a generic `lights.tar` for every upload from every
+// telescope on every night. Two cases:
+//
+//  1. Pre-built archive → preserve `filepath.Base(sourcePath)` verbatim.
+//     `~/night1.tar.zst` becomes `night1.tar.zst` on S3.
+//
+//  2. Directory that we tar locally → use the directory's basename + `.tar`.
+//     `~/telescope/2026-08-15/` becomes `2026-08-15.tar` on S3. Falls back
+//     to `<collectionId>.tar` if the source path resolves to something
+//     without a usable basename (e.g. "." or "/").
+//
+// Historical: earlier versions hardcoded `lights.tar` for every upload.
+// Two consequences that pushed us off that: (a) all archives from the same
+// user in the same collection collided on the S3 key (silent overwrite),
+// (b) the pending-uploads UI card and STILL_NORMALIZING error messages
+// always said "lights.tar" regardless of what the user actually uploaded,
+// which was confusing when multiple sessions were in flight.
+func archiveNameFor(sourcePath, collectionID string, isPreBuilt bool) string {
+	if isPreBuilt {
+		return filepath.Base(sourcePath)
 	}
-	// Lowercase-match against the same set the backend accepts.
-	l := strings.ToLower(filepath.Base(path))
-	for _, ext := range []string{".tar.gz", ".tar.zst", ".tar.bz2", ".tar.xz", ".tgz", ".tar", ".zip"} {
-		if strings.HasSuffix(l, ext) {
-			return "lights" + ext
-		}
+	dir := filepath.Base(filepath.Clean(sourcePath))
+	if dir == "." || dir == "/" || dir == "" {
+		dir = collectionID
 	}
-	return "lights.tar" // fallback shouldn't hit — isTarOrZipFile gated us
+	return dir + ".tar"
 }
 
 func newUploadCmd() *cobra.Command {
@@ -306,7 +319,7 @@ func runArchiveUpload(ctx context.Context, client *api.Client, collectionID, pat
 			src.FileCount, mib(src.TotalSize), path)
 	}
 
-	archiveName := archiveNameFor(path, isPreBuilt)
+	archiveName := archiveNameFor(path, collectionID, isPreBuilt)
 
 	var data *os.File
 	var length int64
@@ -484,10 +497,16 @@ func newStackCmd() *cobra.Command {
 	var scriptID string
 	var instanceType string
 	var params []string
+	var files []string
 	c := &cobra.Command{
 		Use:   "stack <collection-id>",
 		Short: "Kick off a stack of a previously-uploaded collection",
-		Args:  cobra.ExactArgs(1),
+		Long: "Kick off a stack of a previously-uploaded collection.\n\n" +
+			"Under frame-based pricing the backend picks the compute tier from\n" +
+			"the workload shape (frame count + drizzle) — same as the SaaS\n" +
+			"webapp. --instance is an admin-privileged override; the backend\n" +
+			"rejects it for non-admin users.",
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			collectionID := args[0]
 			ctx := cmd.Context()
@@ -506,6 +525,7 @@ func newStackCmd() *cobra.Command {
 				ScriptID:     scriptID,
 				Params:       paramMap,
 				InstanceType: instanceType,
+				IncludeFiles: files,
 			})
 			if err != nil {
 				return err
@@ -519,9 +539,10 @@ func newStackCmd() *cobra.Command {
 			return nil
 		},
 	}
-	c.Flags().StringVar(&scriptID, "script", "", "Catalog script id (seestar | seestar-drizzle | raw-basic)")
+	c.Flags().StringVar(&scriptID, "script", "", "Catalog script id (seestar | seestar-advanced)")
 	c.Flags().StringSliceVar(&params, "param", nil, "Repeatable. key=value")
-	c.Flags().StringVar(&instanceType, "instance", "", "EC2 instance type")
+	c.Flags().StringVar(&instanceType, "instance", "", "[admin-privileged] EC2 instance type override. Backend picks the tier from workload shape for non-admin users and rejects the override.")
+	c.Flags().StringSliceVar(&files, "files", nil, "Comma-separated filename allowlist — only these frames get stacked (default: whole collection). Filenames must match what's on S3 exactly.")
 	return c
 }
 

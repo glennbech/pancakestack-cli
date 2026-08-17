@@ -55,24 +55,38 @@ go install github.com/glennbech/pancakestack-cli/cmd/pancakestack@latest
 # One-time: sign in with Google
 pancakestack login
 
-# Upload a set of light frames
-pancakestack upload m81 ~/astro/m81/lights
+# Upload a night's worth of light frames — one S3 object per FITS
+pancakestack upload m81 ~/astro/m81/lights/*.fit
 
-# Kick off a stack (Seestar default)
+# Kick off a stack (Seestar default). The backend picks the compute tier
+# from frame count + drizzle — no instance flag to worry about.
 pancakestack stack m81
 
-# ...or with drizzle 2× on a bigger instance
-pancakestack stack m81 --script seestar-drizzle --instance r7g.8xlarge
+# Follow the job's log
+pancakestack jobs                    # find the job id
+pancakestack logs <job-id> --follow  # tail it
+
+# Download the finished stack (and every input file) back to disk
+pancakestack download m81
 ```
 
 You'll get an email when the stack finishes.
+
+## Pricing model
+
+pancakestack bills **per frame stacked**, not per minute of compute. The
+backend picks the EC2 instance tier from workload shape (frame count +
+drizzle setting) — same behaviour as the SaaS webapp. The CLI does not
+expose an instance picker for regular users. Admins can pass `--instance`
+on `stack` to override; the backend rejects that override for everyone
+else.
 
 ## Configuration
 
 `pancakestack` reads its backend URL from (in order):
 1. `--url` flag
 2. `PANCAKESTACK_URL` env var
-3. Compiled-in default
+3. Compiled-in default (prod)
 
 Auth tokens live in `~/.config/pancakestack/credentials.json` (mode 0600).
 
@@ -83,8 +97,46 @@ Auth tokens live in `~/.config/pancakestack/credentials.json` (mode 0600).
 | `pancakestack login` | Open browser, sign in with Google, save tokens |
 | `pancakestack whoami` | Print the signed-in user |
 | `pancakestack logout` | Delete stored tokens |
-| `pancakestack upload <collection> <path>` | Tar the path and upload as a collection |
-| `pancakestack stack <collection> [--script X] [--param k=v] [--instance T]` | Stack a previously-uploaded collection |
+| `pancakestack upload <collection> <path>...` | Upload FITS files (or a tar/zip archive) to a collection |
+| `pancakestack download <collection> [dest]` | Download every file in a collection, resumable |
+| `pancakestack stack <collection>` | Kick off a stack on a previously-uploaded collection |
+| `pancakestack jobs [job-id]` | List your jobs, or show details for one |
+| `pancakestack cancel <job-id>...` | Cancel a running job and terminate its instance |
+| `pancakestack logs <job-id>` | Print CloudWatch logs (`--follow`, `--tail N`, `--since 5m`) |
+| `pancakestack metrics <job-id>` | Show CPU / memory / net / EBS time series for a job |
+| `pancakestack ask "<query>"` | Ask the RAG (Siril manual + curated astrophoto docs) |
+
+Run `pancakestack <command> --help` for the full flag list on any of them.
+
+### Upload modes
+
+`pancakestack upload` picks the mode from the paths you hand it:
+
+```bash
+# Multi-file — one S3 object per FITS, per-file dedup and resume:
+pancakestack upload m81 ~/astro/m81/lights/*.fit
+
+# Single archive — you already have a tar/zip:
+pancakestack upload m81 lights.tar.zst
+
+# Directory — tars locally, uploads once:
+pancakestack upload m81 ~/astro/m81/lights/
+```
+
+Multi-file is the recommended path (per-file retry, resumable across
+crashes; files already on S3 skip on re-run). Pass `--archived` on the
+multi-file path to create the collection in cold storage (counts as 70%
+against your storage quota; stacking paused for 30 days).
+
+### Stack subsets
+
+`pancakestack stack <collection>` runs against every frame in the
+collection by default. Pass `--files` to narrow to an allowlist — the
+same list the webapp's Filter Frames flow sends:
+
+```bash
+pancakestack stack m81 --files light_001.fit,light_002.fit,light_003.fit
+```
 
 ## License
 

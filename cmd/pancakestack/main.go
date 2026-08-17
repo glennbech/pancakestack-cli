@@ -46,7 +46,10 @@ func main() {
 	root.AddCommand(newDownloadCmd())
 	root.AddCommand(newStackCmd())
 	root.AddCommand(newJobsCmd())
+	root.AddCommand(newCancelCmd())
 	root.AddCommand(newLogsCmd())
+	root.AddCommand(newMetricsCmd())
+	root.AddCommand(newAskCmd())
 
 	// Suppress cobra's own "Error:" line so the not-activated case can
 	// print the exact one-liner the product wants, and every other error
