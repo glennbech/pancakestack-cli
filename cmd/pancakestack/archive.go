@@ -124,12 +124,16 @@ func newUnarchiveCmd() *cobra.Command {
 
 // pollArchiveTerminal loops GET /collections every pollFreq until either
 // archiveState matches successState / failState, or waitFor elapses.
-// Emits a single-line spinner-ish progress marker on each poll.
+// Prints one status line per state change on stderr; the final
+// terminal line goes to stdout so it survives `2>/dev/null` for
+// scripting flows.
 func pollArchiveTerminal(ctx context.Context, cmd *cobra.Command, client *api.Client,
 	collectionID string, waitFor, pollFreq time.Duration,
 	successState, failState string,
 ) error {
 	deadline := time.Now().Add(waitFor)
+	var lastState string
+	elapsed := time.Now()
 	for {
 		row, err := client.GetCollection(ctx, collectionID)
 		if err != nil {
@@ -138,23 +142,29 @@ func pollArchiveTerminal(ctx context.Context, cmd *cobra.Command, client *api.Cl
 		if row == nil {
 			return fmt.Errorf("poll %s: collection disappeared", collectionID)
 		}
-		switch row.ArchiveState {
+		state := row.ArchiveState
+		if state != lastState {
+			fmt.Fprintf(cmd.ErrOrStderr(), "  %s: %s (%s elapsed)\n",
+				collectionID, humanArchiveState(state), time.Since(elapsed).Truncate(time.Second))
+			lastState = state
+		}
+		switch state {
 		case successState:
-			fmt.Fprintf(cmd.OutOrStdout(), "✓ %s → %s\n", collectionID, successState)
+			fmt.Fprintf(cmd.OutOrStdout(), "✓ %s → %s (%s)\n",
+				collectionID, humanArchiveState(state), time.Since(elapsed).Truncate(time.Second))
 			return nil
 		case failState:
 			msg := row.ArchiveError
 			if msg == "" {
 				msg = "(no error message)"
 			}
-			return fmt.Errorf("✗ %s → %s: %s", collectionID, failState, msg)
+			return fmt.Errorf("✗ %s → %s: %s", collectionID, humanArchiveState(state), msg)
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("timeout after %s waiting for %s (last state=%q)",
-				waitFor, successState, row.ArchiveState)
+			return fmt.Errorf("timeout after %s waiting for %s (last state=%q). "+
+				"Async worker may still complete — poll `GET /collections` if concerned",
+				waitFor, humanArchiveState(successState), state)
 		}
-		// Single-char progress marker on stderr so stdout stays parseable.
-		fmt.Fprint(cmd.ErrOrStderr(), ".")
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -172,6 +182,8 @@ func pollUnarchiveTerminal(ctx context.Context, cmd *cobra.Command, client *api.
 	collectionID string, waitFor, pollFreq time.Duration,
 ) error {
 	deadline := time.Now().Add(waitFor)
+	var lastState string
+	elapsed := time.Now()
 	for {
 		row, err := client.GetCollection(ctx, collectionID)
 		if err != nil {
@@ -180,26 +192,60 @@ func pollUnarchiveTerminal(ctx context.Context, cmd *cobra.Command, client *api.
 		if row == nil {
 			return fmt.Errorf("poll %s: collection disappeared", collectionID)
 		}
+		state := row.ArchiveState
+		if state != lastState {
+			fmt.Fprintf(cmd.ErrOrStderr(), "  %s: %s (%s elapsed)\n",
+				collectionID, humanArchiveState(state), time.Since(elapsed).Truncate(time.Second))
+			lastState = state
+		}
 		if !row.Archived {
-			fmt.Fprintf(cmd.OutOrStdout(), "✓ %s → restored\n", collectionID)
+			fmt.Fprintf(cmd.OutOrStdout(), "✓ %s → restored (%s)\n",
+				collectionID, time.Since(elapsed).Truncate(time.Second))
 			return nil
 		}
-		if row.ArchiveState == "unarchive_failed" {
+		if state == "unarchive_failed" {
 			msg := row.ArchiveError
 			if msg == "" {
 				msg = "(no error message)"
 			}
-			return fmt.Errorf("✗ %s → unarchive_failed: %s", collectionID, msg)
+			return fmt.Errorf("✗ %s → %s: %s", collectionID, humanArchiveState(state), msg)
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("timeout after %s waiting for unarchive (last state=%q)",
-				waitFor, row.ArchiveState)
+			return fmt.Errorf("timeout after %s waiting for unarchive (last state=%q). "+
+				"Async worker may still complete — poll `GET /collections` if concerned",
+				waitFor, state)
 		}
-		fmt.Fprint(cmd.ErrOrStderr(), ".")
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(pollFreq):
 		}
+	}
+}
+
+// humanArchiveState maps the raw wire-value archiveState enum to a
+// short phrase that reads well in CLI output. The wire values are
+// backend jargon (archiving / archived / unarchiving / archive_failed /
+// unarchive_failed) — this table is the single place they're
+// translated for the user. Empty string maps to "not archived" for
+// completeness even though the polling loop never prints that path.
+func humanArchiveState(s string) string {
+	switch s {
+	case "":
+		return "not archived"
+	case "archiving":
+		return "archiving (tar + upload to Backblaze)"
+	case "archived":
+		return "archived (cold storage on Backblaze)"
+	case "unarchiving":
+		return "restoring (download from Backblaze + extract)"
+	case "archive_failed":
+		return "archive failed"
+	case "unarchive_failed":
+		return "restore failed"
+	default:
+		// Unknown state from a future schema change — surface it
+		// verbatim rather than silently mapping to something else.
+		return s
 	}
 }
