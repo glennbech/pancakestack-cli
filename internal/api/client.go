@@ -263,6 +263,87 @@ func (c *Client) CancelJob(ctx context.Context, jobID string) error {
 	return c.postJSON(ctx, "/jobs/"+jobID+"/cancel", struct{}{}, &discard)
 }
 
+// ArchiveCollectionResp mirrors the backend's 202 payload from
+// POST /collections/{id}/archive.
+type ArchiveCollectionResp struct {
+	CollectionID string `json:"collectionId"`
+	Archived     bool   `json:"archived"`
+	ArchivedAt   int64  `json:"archivedAt"`
+	ArchiveState string `json:"archiveState"`
+}
+
+// UnarchiveCollectionResp mirrors the 202 payload from
+// POST /collections/{id}/unarchive.
+type UnarchiveCollectionResp struct {
+	CollectionID string `json:"collectionId"`
+	Archived     bool   `json:"archived"`
+	ArchiveState string `json:"archiveState"`
+}
+
+// ArchiveCollection posts to /collections/{id}/archive with a
+// type-to-confirm body. The server requires `confirm` to equal either
+// the collectionId or the displayName (case-insensitive) — this guards
+// against typos on a destructive-shaped operation. Returns 202 with
+// archiveState="archiving"; the archive-op worker Lambda tars FITS to
+// Backblaze B2 async, so poll GET /collections to see archiveState flip
+// to "archived" (usually within a minute for typical Seestar sizes).
+func (c *Client) ArchiveCollection(ctx context.Context, collectionID, confirm string) (*ArchiveCollectionResp, error) {
+	body := struct {
+		Confirm string `json:"confirm"`
+	}{Confirm: confirm}
+	var resp ArchiveCollectionResp
+	if err := c.postJSON(ctx, "/collections/"+collectionID+"/archive", body, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// UnarchiveCollection posts to /collections/{id}/unarchive. No body
+// required. Server gates on available quota — the collection's full
+// working size must fit in free quota, otherwise returns
+// 402 INSUFFICIENT_STORAGE. On success (202), archiveState flips to
+// "unarchiving" and the worker pulls the tar back from B2. Poll
+// GET /collections for terminal state (archiveState cleared,
+// `archived` attribute removed).
+func (c *Client) UnarchiveCollection(ctx context.Context, collectionID string) (*UnarchiveCollectionResp, error) {
+	var resp UnarchiveCollectionResp
+	if err := c.postJSON(ctx, "/collections/"+collectionID+"/unarchive", struct{}{}, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// CollectionRow is the minimal shape returned by GET /collections for a
+// single row — only the fields the CLI's archive/unarchive polling
+// needs. The server response has more attributes; we ignore them.
+type CollectionRow struct {
+	CollectionID string `json:"collectionId"`
+	DisplayName  string `json:"displayName"`
+	Archived     bool   `json:"archived"`
+	ArchivedAt   int64  `json:"archivedAt"`
+	ArchiveState string `json:"archiveState"`
+	ArchiveError string `json:"archiveError"`
+	SizeBytes    int64  `json:"sizeBytes"`
+}
+
+// GetCollection fetches a single collection row via the list endpoint
+// (server currently has no /collections/{id} GET; the list is small).
+// Returns nil, nil if the collection is not in the response.
+func (c *Client) GetCollection(ctx context.Context, collectionID string) (*CollectionRow, error) {
+	var resp struct {
+		Collections []CollectionRow `json:"collections"`
+	}
+	if err := c.getJSON(ctx, "/collections", nil, &resp); err != nil {
+		return nil, err
+	}
+	for i := range resp.Collections {
+		if resp.Collections[i].CollectionID == collectionID {
+			return &resp.Collections[i], nil
+		}
+	}
+	return nil, nil
+}
+
 // MetricPoint is one time/value sample from GET /jobs/{id}/metrics.
 type MetricPoint struct {
 	T string  `json:"t"`
