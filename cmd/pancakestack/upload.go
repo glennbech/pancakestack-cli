@@ -53,25 +53,20 @@ func archiveNameFor(sourcePath, collectionID string, isPreBuilt bool) string {
 
 func newUploadCmd() *cobra.Command {
 	var concurrency int
-	var archived bool
 	c := &cobra.Command{
 		Use:   "upload <collection-id> <path>...",
 		Short: "Upload FITS files (or an archive) to a named collection",
 		Long: "Uploads N individual files, or a single tar/zip archive, to a\n" +
-			"named collection under your S3 namespace.\n\n" +
+			"named collection.\n\n" +
 			"Modes:\n" +
-			"  pancakestack upload m101 *.fits           # multi-file: one S3 object per file\n" +
-			"  pancakestack upload m101 lights.tar       # transport: userdata extracts on next job\n" +
+			"  pancakestack upload m101 *.fits           # multi-file: one object per file\n" +
+			"  pancakestack upload m101 lights.tar       # transport: extracts on next job\n" +
 			"  pancakestack upload m101 /path/to/dir     # directory: tars locally, uploads once\n\n" +
 			"Under the FITS-primary storage model, individual FITS uploads are the\n" +
 			"recommended path — no local tar step, per-file retry, resumable across\n" +
-			"crashes (files already on S3 skip on re-run).\n\n" +
-			"Flags:\n" +
-			"  --archived    Create the collection in the archived state —\n" +
-			"                counts as 70% against your quota, stacking is\n" +
-			"                paused for 30 days. You can still add files;\n" +
-			"                unarchive to re-enable stacking. Rejected if\n" +
-			"                the collection already exists.",
+			"crashes (files already uploaded skip on re-run).\n\n" +
+			"To archive a collection to cold storage after upload:\n" +
+			"  pancakestack archive <collection-id>",
 		Args: cobra.MinimumNArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			collectionID := args[0]
@@ -92,30 +87,19 @@ func newUploadCmd() *cobra.Command {
 			// because we can't sensibly present N-thousand file uploads
 			// without progress + we already have proven directory support.
 			if len(paths) > 1 || isFitsFile(paths[0]) {
-				return runMultiFileUpload(ctx, client, collectionID, paths, concurrency, archived)
-			}
-			if archived {
-				// The archive upload path is single-object multipart, which
-				// doesn't route through /upload/presign — no createArchived
-				// hook there. Fail fast rather than silently upload as
-				// STANDARD when the user asked for cold storage.
-				return fmt.Errorf("--archived only supported for multi-file (individual FITS) uploads. Pass --archived with `.fit`/`.fits` files, not a tar/zip/directory")
+				return runMultiFileUpload(ctx, client, collectionID, paths, concurrency)
 			}
 			return runArchiveUpload(ctx, client, collectionID, paths[0])
 		},
 	}
 	c.Flags().IntVar(&concurrency, "concurrency", 4,
-		"Max concurrent PUTs to S3 during multi-file upload. Higher = faster on fibre, slower on flaky links.")
-	c.Flags().BoolVar(&archived, "archived", false,
-		"Create the collection in the archived state (counts as 70% against your quota, stacking paused for 30 days).")
+		"Max concurrent uploads during multi-file mode. Higher = faster on fibre, slower on flaky links.")
 	return c
 }
 
 // runMultiFileUpload handles N individual files. Backend preserves each
-// filename verbatim under the collection prefix. archived=true asks the
-// backend to create the collection directly in Standard-IA — only valid
-// for a brand-new collection.
-func runMultiFileUpload(ctx context.Context, client *api.Client, collectionID string, paths []string, concurrency int, archived bool) error {
+// filename verbatim under the collection prefix.
+func runMultiFileUpload(ctx context.Context, client *api.Client, collectionID string, paths []string, concurrency int) error {
 	// Validate + stat everything upfront. Total size drives the ETA.
 	var totalBytes int64
 	seen := make(map[string]string, len(paths))
@@ -151,15 +135,11 @@ func runMultiFileUpload(ctx context.Context, client *api.Client, collectionID st
 	var lastPrint time.Time
 	var printMu sync.Mutex
 
-	if archived {
-		fmt.Fprintln(os.Stderr, "· Creating collection as archived — stacking paused for 30 days.")
-	}
 	results, err := client.UploadFilesBulk(ctx, api.BulkUploadOptions{
 		CollectionID:   collectionID,
 		Paths:          paths,
 		SHA256s:        shas,
 		Concurrency:    concurrency,
-		CreateArchived: archived,
 		OnFileDone: func(name string, done, total int) {
 			if info, err := os.Stat(seen[name]); err == nil {
 				atomic.AddInt64(&completedBytes, info.Size())
@@ -348,7 +328,7 @@ func runArchiveUpload(ctx context.Context, client *api.Client, collectionID, pat
 	// hashes identically across runs (mtimes, file ordering), so the
 	// SHA-256 is ~pure overhead — for a 38 GB tar it's 5+ min of CPU
 	// just to send a value the backend won't dedup on.
-	fmt.Fprintf(os.Stderr, "Uploading %.1f MB to S3 (multipart, archive %s)...\n",
+	fmt.Fprintf(os.Stderr, "Uploading %.1f MB (multipart, archive %s)...\n",
 		mib(length), archiveName)
 	started := time.Now()
 	progress := newProgressPrinter(started)

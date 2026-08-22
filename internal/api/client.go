@@ -648,21 +648,12 @@ type PresignBulkFile struct {
 type presignBulkReq struct {
 	CollectionID string            `json:"collectionId"`
 	Files        []PresignBulkFile `json:"files"`
-	// CreateArchived tells the backend to auto-materialize a *new*
-	// collection in the archived state. Presigned URLs come back with
-	// StorageClass=STANDARD_IA baked in — client MUST send matching
-	// x-amz-storage-class header on each PUT.
-	CreateArchived bool `json:"createArchived,omitempty"`
 }
 type PresignedFile struct {
 	Name      string `json:"name"`
 	Key       string `json:"key,omitempty"`
 	URL       string `json:"url,omitempty"`
 	ExpiresIn int    `json:"expiresIn,omitempty"`
-	// StorageClass, when set, is a signed header value that MUST be sent
-	// as `x-amz-storage-class` on the PUT — otherwise S3 rejects with
-	// 403 SignatureDoesNotMatch. Populated for createArchived=true.
-	StorageClass string `json:"storageClass,omitempty"`
 	// Skipped=true → backend already has this checksum in the
 	// collection. Client should NOT PUT bytes for this entry.
 	Skipped     bool   `json:"skipped,omitempty"`
@@ -676,23 +667,10 @@ type presignBulkResp struct {
 // PresignBulk asks the backend to sign single-PUT URLs for up to 500
 // files at once. Chunk client-side above 500.
 func (c *Client) PresignBulk(ctx context.Context, collectionID string, files []PresignBulkFile) ([]PresignedFile, error) {
-	return c.presignBulkInternal(ctx, collectionID, files, false)
-}
-
-// PresignBulkArchived is PresignBulk with createArchived=true. Backend
-// materializes a brand-new archived collection; presigned URLs come
-// back signed for StorageClass=STANDARD_IA so the client must send the
-// x-amz-storage-class header on each PUT.
-func (c *Client) PresignBulkArchived(ctx context.Context, collectionID string, files []PresignBulkFile) ([]PresignedFile, error) {
-	return c.presignBulkInternal(ctx, collectionID, files, true)
-}
-
-func (c *Client) presignBulkInternal(ctx context.Context, collectionID string, files []PresignBulkFile, createArchived bool) ([]PresignedFile, error) {
 	var resp presignBulkResp
 	if err := c.postJSON(ctx, "/upload/presign", presignBulkReq{
-		CollectionID:   collectionID,
-		Files:          files,
-		CreateArchived: createArchived,
+		CollectionID: collectionID,
+		Files:        files,
 	}, &resp); err != nil {
 		return nil, err
 	}
@@ -709,12 +687,8 @@ type BulkUploadOptions struct {
 	// before returning a presigned URL. Caller hashes upfront so it can
 	// report hashing progress separately from upload progress.
 	SHA256s []string
-	// CreateArchived=true materializes a brand-new archived collection
-	// on this upload. Presigns come back with StorageClass=STANDARD_IA
-	// baked in; the client MUST send x-amz-storage-class on each PUT.
-	CreateArchived bool
-	// Concurrency in-flight PUTs. Default 4 — S3 handles more but home
-	// upstreams choke past that. CLI lets user override.
+	// Concurrency in-flight PUTs. Default 4 — the storage backend handles
+	// more but home upstreams choke past that. CLI lets user override.
 	Concurrency int
 	// OnFileDone fires once per file after successful PUT. May be called
 	// from many goroutines. `done`/`total` are file counts, not bytes.
@@ -788,7 +762,7 @@ func (c *Client) UploadFilesBulk(ctx context.Context, opts BulkUploadOptions) ([
 		if end > len(names) {
 			end = len(names)
 		}
-		batch, err := c.presignBulkInternal(ctx, opts.CollectionID, names[start:end], opts.CreateArchived)
+		batch, err := c.PresignBulk(ctx, opts.CollectionID, names[start:end])
 		if err != nil {
 			return nil, fmt.Errorf("presign batch [%d..%d]: %w", start, end, err)
 		}
@@ -849,7 +823,7 @@ func (c *Client) UploadFilesBulk(ctx context.Context, opts BulkUploadOptions) ([
 				}
 				return
 			}
-			if err := putPresignedObject(ctx, pf.URL, f, info.Size(), contentTypeFor(pf.Name), pf.StorageClass); err != nil {
+			if err := putPresignedObject(ctx, pf.URL, f, info.Size(), contentTypeFor(pf.Name)); err != nil {
 				results[i] = BulkUploadResult{Name: pf.Name, Key: pf.Key, Error: err}
 				if opts.OnFileError != nil {
 					opts.OnFileError(pf.Name, err)
@@ -869,29 +843,22 @@ func (c *Client) UploadFilesBulk(ctx context.Context, opts BulkUploadOptions) ([
 
 // putPresignedObject PUTs a whole file to a presigned URL. Content-Type
 // header must match the one baked into the signed URL — the backend
-// signs with the same value we compute here. If storageClass is set
-// (createArchived path), we also echo `x-amz-storage-class` — that
-// header is part of the signed set when the SDK bakes StorageClass
-// into the URL, and S3 rejects the PUT with 403 SignatureDoesNotMatch
-// without the exact same value.
-func putPresignedObject(ctx context.Context, presignedURL string, body io.Reader, length int64, contentType, storageClass string) error {
+// signs with the same value we compute here.
+func putPresignedObject(ctx context.Context, presignedURL string, body io.Reader, length int64, contentType string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, presignedURL, body)
 	if err != nil {
 		return err
 	}
 	req.ContentLength = length
 	req.Header.Set("Content-Type", contentType)
-	if storageClass != "" {
-		req.Header.Set("x-amz-storage-class", storageClass)
-	}
 	resp, err := (&http.Client{}).Do(req)
 	if err != nil {
-		return fmt.Errorf("PUT to S3: %w", err)
+		return fmt.Errorf("PUT: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
 		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("S3 returned %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+		return fmt.Errorf("storage backend returned %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
 	}
 	return nil
 }

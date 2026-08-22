@@ -11,11 +11,11 @@ import (
 )
 
 // `pancakestack archive <collection-id>` — POST /collections/{id}/archive
-// then poll until the archive-op worker Lambda writes the terminal state.
-// The backend tars every FITS under the collection prefix, uploads to
-// Backblaze B2, and deletes the S3 originals. Collection counts against
-// storage quota at 50% of raw size once archived; stacking is paused
-// until unarchive.
+// then poll until the archive-op worker writes the terminal state.
+// The backend tars every FITS under the collection prefix, moves the tar
+// to cold storage, and deletes the working-tier originals. Collection
+// counts against storage quota at 50% of raw size once archived; stacking
+// is paused until unarchive.
 //
 // Type-to-confirm: the CLI passes the collectionId as the `confirm`
 // field automatically. Server-side that string must match either the
@@ -29,8 +29,8 @@ func newArchiveCmd() *cobra.Command {
 	)
 	cmd := &cobra.Command{
 		Use:   "archive <collection-id>",
-		Short: "Archive a collection to Backblaze B2 cold storage",
-		Long: "Files are tarred and moved to Backblaze B2. Collection counts " +
+		Short: "Archive a collection to cold storage",
+		Long: "Files are tarred and moved to cold storage. Collection counts " +
 			"against storage quota at 50% of raw size while archived, and " +
 			"cannot be stacked until unarchived (see `pancakestack unarchive`).\n\n" +
 			"Waits (up to --timeout) for the async worker to write the " +
@@ -69,9 +69,10 @@ func newArchiveCmd() *cobra.Command {
 }
 
 // `pancakestack unarchive <collection-id>` — the inverse. Pulls the tar
-// back from B2, extracts it to the original S3 keys, deletes the B2
-// object. Gated on quota: the full working size must fit in the
-// account's free storage or the server returns 402 INSUFFICIENT_STORAGE.
+// back from cold storage, extracts it to the working tier, deletes the
+// cold-tier object. Gated on quota: the full working size must fit in
+// the account's free storage or the server returns 402
+// INSUFFICIENT_STORAGE.
 func newUnarchiveCmd() *cobra.Command {
 	var (
 		noWait   bool
@@ -80,10 +81,11 @@ func newUnarchiveCmd() *cobra.Command {
 	)
 	cmd := &cobra.Command{
 		Use:   "unarchive <collection-id>",
-		Short: "Restore an archived collection from Backblaze B2 back to S3",
-		Long: "Pulls the tar from Backblaze B2 and extracts it back into S3. " +
-			"The collection's full working size must fit in your free storage " +
-			"quota — otherwise the server returns INSUFFICIENT_STORAGE.\n\n" +
+		Short: "Restore an archived collection from cold storage",
+		Long: "Pulls the tar from cold storage and extracts it back into the " +
+			"working tier. The collection's full working size must fit in your " +
+			"free storage quota — otherwise the server returns " +
+			"INSUFFICIENT_STORAGE.\n\n" +
 			"Waits (up to --timeout) for the async worker to write the " +
 			"terminal state. Use --no-wait to fire and forget.",
 		Args: cobra.ExactArgs(1),
@@ -229,16 +231,20 @@ func pollUnarchiveTerminal(ctx context.Context, cmd *cobra.Command, client *api.
 // unarchive_failed) — this table is the single place they're
 // translated for the user. Empty string maps to "not archived" for
 // completeness even though the polling loop never prints that path.
+//
+// User-facing copy stays vendor-neutral (no "Backblaze" / "B2" / "S3"
+// leaks) — per AGENTS.md, storage backends are implementation details
+// that shouldn't reach users.
 func humanArchiveState(s string) string {
 	switch s {
 	case "":
 		return "not archived"
 	case "archiving":
-		return "archiving (tar + upload to Backblaze)"
+		return "archiving (moving to cold storage)"
 	case "archived":
-		return "archived (cold storage on Backblaze)"
+		return "archived (cold storage)"
 	case "unarchiving":
-		return "restoring (download from Backblaze + extract)"
+		return "restoring (extracting from cold storage)"
 	case "archive_failed":
 		return "archive failed"
 	case "unarchive_failed":
