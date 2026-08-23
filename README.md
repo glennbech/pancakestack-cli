@@ -105,6 +105,7 @@ Auth tokens live in `~/.config/pancakestack/credentials.json` (mode 0600).
 | `pancakestack logs <job-id>` | Print CloudWatch logs (`--follow`, `--tail N`, `--since 5m`) |
 | `pancakestack metrics <job-id>` | Show CPU / memory / net / EBS time series for a job |
 | `pancakestack ask "<query>"` | Ask the RAG (Siril manual + curated astrophoto docs) |
+| `pancakestack seestar …` | Talk to a ZWO Seestar on your LAN — see [Seestar integration](#seestar-integration) below |
 
 Run `pancakestack <command> --help` for the full flag list on any of them.
 
@@ -137,6 +138,66 @@ same list the webapp's Filter Frames flow sends:
 ```bash
 pancakestack stack m81 --files light_001.fit,light_002.fit,light_003.fit
 ```
+
+## Seestar integration
+
+Power-user only. `pancakestack seestar` talks to a ZWO Seestar smart
+telescope over your local network — enumerate observation folders,
+list frames, and continuously stream new FITS into a collection as the
+scope captures them.
+
+**You need your own RSA key.** Firmware 7.18 and later require a
+challenge-response handshake on the JSON-RPC port, and the private key
+is not distributed with this CLI. The extraction has to happen on your
+Android phone against your own copy of the ZWO Seestar app — see
+[astronomyk/seestarpy](https://github.com/astronomyk/seestarpy) for the
+walkthrough and tooling.
+
+Once you have the PEM, drop it in one of these locations (searched in
+order — first hit wins):
+
+1. Whatever `SEESTAR_KEY_PATH` points at (explicit override)
+2. `~/.config/pancakestack/seestar.pem` (this CLI's config dir — recommended)
+3. `./seestar.pem` (current working directory — handy for one-off scripts)
+4. `~/.seestarpy/seestar.pem` (seestarpy compat — if you already extracted
+   the PEM for that tool, you don't have to move it)
+
+Both the file itself and the containing directory should be `chmod 700`
+/ `600` — the key is per-device and there's no revocation flow.
+
+**Prerequisite: station mode.** The scope has to be joined to your
+home Wi-Fi (not broadcasting its own hotspot), so your laptop can reach
+both it and the internet at the same time.
+
+### Verbs
+
+```bash
+# UDP-broadcast for scopes on the local subnet
+pancakestack seestar discover
+
+# List every observation folder under MyWorks/ on the scope
+pancakestack seestar ls
+
+# List every FITS inside one folder
+pancakestack seestar ls "M 81_sub"
+
+# Continuously upload every new FITS from an observation folder into a
+# pancakestack collection as the scope captures them. State lives in
+# ~/.pancakestack/seestar-sync.json so a restart never re-uploads.
+pancakestack seestar sync "M 81_sub" m81-tonight
+
+# Auto-kick a stack once 50 frames have landed:
+pancakestack seestar sync "M 81_sub" m81-tonight \
+  --stack-when 50 --stack-script seestar-advanced
+```
+
+While `seestar sync` is running, the webapp's collection detail page
+shows a green **"Live import in progress"** banner — heartbeated by
+the CLI every few seconds and cleared automatically when the process
+exits.
+
+Multiple scopes on the LAN? Pass `--ip <address>` to any subcommand to
+skip discovery.
 
 ## License
 

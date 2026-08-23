@@ -52,6 +52,7 @@ func main() {
 	root.AddCommand(newAskCmd())
 	root.AddCommand(newArchiveCmd())
 	root.AddCommand(newUnarchiveCmd())
+	root.AddCommand(newSeestarCmd())
 
 	// Suppress cobra's own "Error:" line so the not-activated case can
 	// print the exact one-liner the product wants, and every other error

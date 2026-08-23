@@ -313,6 +313,21 @@ func (c *Client) UnarchiveCollection(ctx context.Context, collectionID string) (
 	return &resp, nil
 }
 
+// LiveImportHeartbeat posts a keep-alive to the backend so the webapp's
+// collection detail page can show a "Live import in progress" banner
+// while `pancakestack seestar sync` (or any other live uploader) is
+// running. The server treats the collection as live for 15s after the
+// most recent heartbeat, so tick at least every 5s. Best-effort: on
+// failure the caller logs and moves on, since the sync loop's own work
+// is unaffected by the banner being briefly missing.
+func (c *Client) LiveImportHeartbeat(ctx context.Context, collectionID, folder string, filesSeen int) error {
+	body := struct {
+		Folder    string `json:"folder,omitempty"`
+		FilesSeen int    `json:"filesSeen,omitempty"`
+	}{Folder: folder, FilesSeen: filesSeen}
+	return c.postJSON(ctx, "/collections/"+collectionID+"/live-import/heartbeat", body, nil)
+}
+
 // CollectionRow is the minimal shape returned by GET /collections for a
 // single row — only the fields the CLI's archive/unarchive polling
 // needs. The server response has more attributes; we ignore them.
@@ -547,6 +562,12 @@ func (c *Client) postJSON(ctx context.Context, path string, body any, out any) e
 			return ErrNotActivated
 		}
 		return fmt.Errorf("%s returned %d: %s", path, resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	// out == nil skips decoding — for endpoints that return 204 or a body
+	// the caller doesn't care about (e.g. live-import heartbeat).
+	if out == nil {
+		io.Copy(io.Discard, resp.Body)
+		return nil
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
 }

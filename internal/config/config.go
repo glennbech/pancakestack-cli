@@ -25,14 +25,41 @@ func BackendURL(flagValue string) string {
 // CredentialsPath is where we store OAuth tokens. Respects XDG_CONFIG_HOME,
 // falls back to ~/.config/pancakestack.
 func CredentialsPath() (string, error) {
-	dir, err := configDir()
+	dir, err := ConfigDir()
 	if err != nil {
 		return "", err
 	}
 	return filepath.Join(dir, "credentials.json"), nil
 }
 
-func configDir() (string, error) {
+// SeestarKeyPath is the primary lookup for the Seestar RSA PEM. Kept
+// alongside credentials.json so one config dir owns every secret the
+// CLI needs. Seestar auth code also falls back to the seestarpy layout
+// (env var + ~/.seestarpy/seestar.pem) so users already set up with
+// that tooling work out of the box.
+func SeestarKeyPath() (string, error) {
+	dir, err := ConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "seestar.pem"), nil
+}
+
+// SeestarStatePath is the sync-loop's per-file bookkeeping — same
+// config dir as everything else, keeps a wipe-and-restart to one
+// obvious location.
+func SeestarStatePath() (string, error) {
+	dir, err := ConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "seestar-sync.json"), nil
+}
+
+// ConfigDir returns the resolved config directory (~/.config/pancakestack
+// by default). Exported so the seestar package can drop files next to
+// credentials.json.
+func ConfigDir() (string, error) {
 	if v := os.Getenv("XDG_CONFIG_HOME"); v != "" {
 		return filepath.Join(v, "pancakestack"), nil
 	}
