@@ -72,15 +72,6 @@ pancakestack download m81
 
 You'll get an email when the stack finishes.
 
-## Pricing model
-
-pancakestack bills **per frame stacked**, not per minute of compute. The
-backend picks the EC2 instance tier from workload shape (frame count +
-drizzle setting) — same behaviour as the SaaS webapp. The CLI does not
-expose an instance picker for regular users. Admins can pass `--instance`
-on `stack` to override; the backend rejects that override for everyone
-else.
-
 ## Configuration
 
 `pancakestack` reads its backend URL from (in order):
