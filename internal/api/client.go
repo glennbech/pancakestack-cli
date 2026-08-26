@@ -77,15 +77,27 @@ type multipartInitReq struct {
 	Filename     string `json:"filename"`
 	ContentType  string `json:"contentType,omitempty"`
 	SHA256       string `json:"sha256,omitempty"`
+	// SizeBytes is the total file size in bytes. Required by the backend
+	// as of the storage-quota-enforcement change (pancakestack#7) — used
+	// to reject uploads that would exceed the caller's plan cap before
+	// the multipart upload is minted.
+	SizeBytes int64 `json:"sizeBytes"`
 }
 
 // InitMultipartUpload starts a multipart upload for the given collection archive.
 // sha256 is the lowercase-hex SHA-256 of the file, or empty to skip client-side
 // dedup. Pass a hash for the per-file path where dedup is worth the cost; skip
 // it for opaque archives where re-tar rarely produces byte-identical output.
-func (c *Client) InitMultipartUpload(ctx context.Context, collectionID, filename, contentType, sha256 string) (*MultipartInitResp, error) {
+// sizeBytes is required (see multipartInitReq.SizeBytes for why).
+func (c *Client) InitMultipartUpload(ctx context.Context, collectionID, filename, contentType, sha256 string, sizeBytes int64) (*MultipartInitResp, error) {
 	var resp MultipartInitResp
-	body := multipartInitReq{CollectionID: collectionID, Filename: filename, ContentType: contentType, SHA256: sha256}
+	body := multipartInitReq{
+		CollectionID: collectionID,
+		Filename:     filename,
+		ContentType:  contentType,
+		SHA256:       sha256,
+		SizeBytes:    sizeBytes,
+	}
 	if err := c.postJSON(ctx, "/upload/init", body, &resp); err != nil {
 		return nil, err
 	}
@@ -623,6 +635,9 @@ func (c *Client) getJSON(ctx context.Context, path string, query map[string]stri
 		if isUnapproved(resp.StatusCode, body) {
 			return ErrNotActivated
 		}
+		if qErr := parseStorageQuotaExceeded(resp.StatusCode, body); qErr != nil {
+			return qErr
+		}
 		return fmt.Errorf("%s returned %d: %s", path, resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
@@ -641,6 +656,49 @@ func isUnapproved(status int, body []byte) bool {
 		return false
 	}
 	return e.Code == "UNAPPROVED"
+}
+
+// StorageQuotaExceededError is the typed error the API client returns
+// when the backend rejects an upload/import with 402 STORAGE_QUOTA_EXCEEDED.
+// Numeric fields let CLI commands render a formatted message + a --json
+// dump for scripts.
+type StorageQuotaExceededError struct {
+	Message   string `json:"error"`
+	Used      int64  `json:"used"`
+	Quota     int64  `json:"quota"`
+	Requested int64  `json:"requested"`
+	Shortfall int64  `json:"shortfall"`
+}
+
+func (e *StorageQuotaExceededError) Error() string { return e.Message }
+
+// parseStorageQuotaExceeded returns nil for anything but the specific
+// 402 STORAGE_QUOTA_EXCEEDED shape.
+func parseStorageQuotaExceeded(status int, body []byte) *StorageQuotaExceededError {
+	if status != http.StatusPaymentRequired {
+		return nil
+	}
+	var e struct {
+		Code      string `json:"code"`
+		Message   string `json:"error"`
+		Used      int64  `json:"used"`
+		Quota     int64  `json:"quota"`
+		Requested int64  `json:"requested"`
+		Shortfall int64  `json:"shortfall"`
+	}
+	if err := json.Unmarshal(body, &e); err != nil {
+		return nil
+	}
+	if e.Code != "STORAGE_QUOTA_EXCEEDED" {
+		return nil
+	}
+	return &StorageQuotaExceededError{
+		Message:   e.Message,
+		Used:      e.Used,
+		Quota:     e.Quota,
+		Requested: e.Requested,
+		Shortfall: e.Shortfall,
+	}
 }
 
 // ensureFreshTokens refreshes tokens proactively if they're near expiry.
@@ -665,6 +723,11 @@ type PresignBulkFile struct {
 	Name        string `json:"name"`
 	ContentType string `json:"contentType,omitempty"`
 	SHA256      string `json:"sha256"`
+	// SizeBytes is required by the backend as of the storage-quota-
+	// enforcement change (pancakestack#7). Backend sums non-duplicate
+	// sizes across the batch and rejects the whole request if it would
+	// push the caller past their plan cap.
+	SizeBytes int64 `json:"sizeBytes"`
 }
 type presignBulkReq struct {
 	CollectionID string            `json:"collectionId"`
@@ -776,7 +839,19 @@ func (c *Client) UploadFilesBulk(ctx context.Context, opts BulkUploadOptions) ([
 	for i, p := range opts.Paths {
 		name := filepath.Base(p)
 		ct := contentTypeFor(name)
-		names = append(names, PresignBulkFile{Name: name, ContentType: ct, SHA256: opts.SHA256s[i]})
+		// Stat for size — backend requires it for the storage-quota gate.
+		// One extra syscall per file; negligible next to the hash we
+		// already computed and the S3 PUT we're about to issue.
+		st, err := os.Stat(p)
+		if err != nil {
+			return nil, fmt.Errorf("stat %s: %w", p, err)
+		}
+		names = append(names, PresignBulkFile{
+			Name:        name,
+			ContentType: ct,
+			SHA256:      opts.SHA256s[i],
+			SizeBytes:   st.Size(),
+		})
 	}
 	for start := 0; start < len(names); start += presignBulkChunkSize {
 		end := start + presignBulkChunkSize
@@ -933,7 +1008,7 @@ func (c *Client) UploadFileMultipart(ctx context.Context, opts MultipartUploadOp
 	if contentType == "" {
 		contentType = "application/octet-stream"
 	}
-	init, err := c.InitMultipartUpload(ctx, opts.CollectionID, opts.Filename, contentType, opts.SHA256)
+	init, err := c.InitMultipartUpload(ctx, opts.CollectionID, opts.Filename, contentType, opts.SHA256, opts.Size)
 	if err != nil {
 		return nil, err
 	}
