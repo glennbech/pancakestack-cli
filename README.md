@@ -174,13 +174,21 @@ pancakestack seestar ls "M 81_sub"
 
 # Continuously upload every new FITS from an observation folder into a
 # pancakestack collection as the scope captures them. State lives in
-# ~/.pancakestack/seestar-sync.json so a restart never re-uploads.
-pancakestack seestar sync "M 81_sub" m81-tonight
+# ~/.config/pancakestack/seestar-sync.json so a restart never re-uploads.
+# On the FIRST sync of a folder pick either --from-now (skip whatever's
+# already on the scope, only upload frames captured afterwards) or
+# --backfill (upload everything that's already there too):
+pancakestack seestar sync "M 81_sub" m81-tonight --from-now
 
 # Auto-kick a stack once 50 frames have landed:
-pancakestack seestar sync "M 81_sub" m81-tonight \
+pancakestack seestar sync "M 81_sub" m81-tonight --from-now \
   --stack-when 50 --stack-script seestar-advanced
 ```
+
+State is keyed by `(folder, filename)` — not by scope serial — so
+swapping scopes (S30 → S50p, firmware reflash, etc.) keeps
+deduplication working. A pre-2.0 state file with serial-in-key
+entries is migrated in place on first load.
 
 While `seestar sync` is running, the webapp's collection detail page
 shows a green **"Live import in progress"** banner — heartbeated by

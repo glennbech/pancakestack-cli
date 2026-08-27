@@ -66,6 +66,16 @@ type SyncOptions struct {
 	// State stores which files have already been uploaded across
 	// process restarts.
 	State *State
+	// FromNow, when true on a first-run for this (serial, folder),
+	// baselines every file currently on the scope as "already seen"
+	// and only uploads frames that appear on subsequent polls. Ignored
+	// once state has entries — you can't un-see files.
+	FromNow bool
+	// Backfill is the opt-in for the classic behavior: on first run,
+	// upload every FITS the scope already holds. Required (with
+	// FromNow as the alternative) to prevent accidental multi-GB
+	// downloads of a folder full of previous nights' subs.
+	Backfill bool
 	// Log lets the caller decide where progress lines go. Stderr is
 	// the usual choice; nil silences output.
 	Log func(format string, args ...any)
@@ -99,6 +109,29 @@ func Run(ctx context.Context, opts SyncOptions) error {
 		return fmt.Errorf("cannot reach scope at %s: %w", opts.Device.IP, err)
 	}
 	opts.Log("connected: %s (%s) at %s\n", opts.Device.Model, opts.Device.Serial, opts.Device.IP)
+
+	// First-run gate: if state has zero entries for this folder,
+	// force the caller to pick between --from-now (skip existing) and
+	// --backfill (upload everything). Without this, a fresh sync of a
+	// folder that already contains a night's worth of subs silently
+	// downloads and uploads all of them — the exact regression that
+	// prompted this flag.
+	firstRun := opts.State.CountFolder(opts.Folder) == 0
+	if firstRun && !opts.FromNow && !opts.Backfill {
+		return fmt.Errorf(
+			"first sync of folder %q — pass --from-now to skip files "+
+				"already on the scope and only upload new frames, or "+
+				"--backfill to upload everything already there",
+			opts.Folder,
+		)
+	}
+	if firstRun && opts.FromNow {
+		n, err := baselineExisting(ctx, rpc, opts)
+		if err != nil {
+			return fmt.Errorf("baseline: %w", err)
+		}
+		opts.Log("· baseline: marked %d existing file(s) as already-seen (--from-now)\n", n)
+	}
 
 	// Heartbeat ticker — every 5s post the last-known scope listing
 	// snapshot to the backend so the webapp can render the "Live import"
@@ -141,7 +174,7 @@ func Run(ctx context.Context, opts SyncOptions) error {
 			if f.Size == 0 {
 				continue
 			}
-			if opts.State.Has(opts.Device.Serial, opts.Folder, f.Name, f.Size) {
+			if opts.State.Has(opts.Folder, f.Name, f.Size) {
 				continue
 			}
 			key := f.Name
@@ -317,6 +350,43 @@ func runHeartbeat(
 			beat()
 		}
 	}
+}
+
+// baselineExisting lists the folder once and records every current
+// file as already-uploaded, without downloading anything. Used by
+// --from-now so a fresh sync only picks up frames that appear on
+// subsequent polls — avoids re-pulling a folder full of previous
+// nights' subs. Files still growing on the scope (unstable size)
+// are baselined too; that's fine because their next-poll size will
+// differ from the baselined value and the state check falls through
+// to a normal upload.
+func baselineExisting(ctx context.Context, rpc *Client, opts SyncOptions) (int, error) {
+	files, err := rpc.ListFiles(ctx, opts.Folder)
+	if err != nil {
+		return 0, err
+	}
+	if len(files) == 0 {
+		return 0, nil
+	}
+	now := time.Now().UTC()
+	entries := make([]SyncEntry, 0, len(files))
+	for _, f := range files {
+		if f.Size == 0 {
+			continue
+		}
+		entries = append(entries, SyncEntry{
+			Serial:     opts.Device.Serial,
+			Folder:     opts.Folder,
+			Filename:   f.Name,
+			Size:       f.Size,
+			Collection: "", // baseline entries have no collection
+			UploadedAt: now,
+		})
+	}
+	if err := opts.State.MarkBatch(entries); err != nil {
+		return 0, err
+	}
+	return len(entries), nil
 }
 
 // downloadToWithSHA streams one file to disk and returns its

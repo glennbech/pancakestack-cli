@@ -39,6 +39,13 @@ type SyncEntry struct {
 // or unreadable → empty state, no error — new machines just start
 // fresh. Corrupt (malformed JSON) → error, so we don't silently
 // re-upload thousands of frames.
+//
+// Migrates v1 (serial-keyed) state to the current scope-agnostic key
+// format on the fly. v1 keyed entries by (serial, folder, filename),
+// which broke deduplication whenever the user switched scopes even
+// though the actual files were identical — so we re-map by the
+// self-identifying data inside each entry and never write serial-
+// dependent keys again.
 func LoadState(path string) (*State, error) {
 	if path == "" {
 		p, err := DefaultStatePath()
@@ -48,7 +55,7 @@ func LoadState(path string) (*State, error) {
 		path = p
 	}
 	s := &State{
-		Version: 1,
+		Version: 2,
 		Entries: map[string]*SyncEntry{},
 		path:    path,
 	}
@@ -69,6 +76,20 @@ func LoadState(path string) (*State, error) {
 		s.Entries = map[string]*SyncEntry{}
 	}
 	s.path = path
+	if s.Version < 2 {
+		migrated := make(map[string]*SyncEntry, len(s.Entries))
+		for _, e := range s.Entries {
+			if e == nil || e.Folder == "" || e.Filename == "" {
+				continue
+			}
+			migrated[entryKey(e.Folder, e.Filename)] = e
+		}
+		s.Entries = migrated
+		s.Version = 2
+		if err := s.saveLocked(); err != nil {
+			return nil, fmt.Errorf("save migrated state %s: %w", path, err)
+		}
+	}
 	return s, nil
 }
 
@@ -101,21 +122,24 @@ func configDirLocal() (string, error) {
 	return filepath.Join(home, ".config", "pancakestack"), nil
 }
 
-// entryKey composes the (serial, folder, filename) tuple into one
-// map key. Filenames on the Seestar carry a UTC timestamp so
-// collisions across sessions don't exist — the size field is a
-// cheap extra guard against a truncated/growing file.
-func entryKey(serial, folder, filename string) string {
-	return serial + "\x00" + folder + "\x00" + filename
+// entryKey composes the (folder, filename) tuple into one map key.
+// Deliberately does NOT include scope serial: Seestar filenames carry
+// a UTC timestamp + target + exposure + filter so collisions across
+// scopes are astronomically unlikely, and including the serial broke
+// deduplication for anyone who replaced or added a scope (v1 bug).
+// The size field on Has() is a cheap extra guard against a
+// truncated/growing file.
+func entryKey(folder, filename string) string {
+	return folder + "\x00" + filename
 }
 
 // Has reports whether this file has already been uploaded at the
 // given size. A size mismatch → false, so a truncated / regrown
 // file will re-upload.
-func (s *State) Has(serial, folder, filename string, size int64) bool {
+func (s *State) Has(folder, filename string, size int64) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	e, ok := s.Entries[entryKey(serial, folder, filename)]
+	e, ok := s.Entries[entryKey(folder, filename)]
 	if !ok {
 		return false
 	}
@@ -127,8 +151,41 @@ func (s *State) Has(serial, folder, filename string, size int64) bool {
 func (s *State) Mark(entry SyncEntry) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.Entries[entryKey(entry.Serial, entry.Folder, entry.Filename)] = &entry
+	s.Entries[entryKey(entry.Folder, entry.Filename)] = &entry
 	return s.saveLocked()
+}
+
+// MarkBatch records many entries with a single fsync — used by
+// `--from-now` baselining, which can dump hundreds of pre-existing
+// files at once and would otherwise hammer the disk with one write
+// per file.
+func (s *State) MarkBatch(entries []SyncEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range entries {
+		e := entries[i]
+		s.Entries[entryKey(e.Folder, e.Filename)] = &e
+	}
+	return s.saveLocked()
+}
+
+// CountFolder returns how many entries exist for one folder across
+// all scopes. Used by the sync command to detect first-run for a
+// given folder so it can force the user to pick between --from-now
+// and --backfill instead of silently pulling yesterday's frames.
+func (s *State) CountFolder(folder string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, e := range s.Entries {
+		if e.Folder == folder {
+			n++
+		}
+	}
+	return n
 }
 
 // saveLocked writes the state atomically (write to tmp, rename over

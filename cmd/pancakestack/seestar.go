@@ -176,22 +176,29 @@ func newSeestarSyncCmd() *cobra.Command {
 	var stackWhen int
 	var stackScript string
 	var stackParams []string
+	var fromNow, backfill bool
 
 	c := &cobra.Command{
 		Use:   "sync <folder> <collection-id>",
 		Short: "Continuously upload new FITS from a scope folder into a collection",
 		Long: "Watches an observation folder on the scope and streams every\n" +
 			"new .fit through to a pancakestack collection as it lands.\n" +
-			"State is tracked in ~/.pancakestack/seestar-sync.json so a\n" +
-			"restart never re-uploads.\n\n" +
+			"State is tracked in ~/.config/pancakestack/seestar-sync.json so\n" +
+			"a restart never re-uploads.\n\n" +
+			"On the FIRST sync of a folder you must pick one of:\n" +
+			"  --from-now   record every file already on the scope as seen\n" +
+			"               and only upload frames that appear afterwards\n" +
+			"  --backfill   upload every existing file too\n" +
+			"After the first run either flag becomes a no-op — subsequent\n" +
+			"runs just pick up new files.\n\n" +
 			"Only .fit files are uploaded — the scope's own JPEG previews and\n" +
 			"thumbnails are skipped (pancakestack renders its own siblings\n" +
 			"server-side, so uploading them would be duplicate work).\n\n" +
 			"Ctrl-C exits after the current cycle.\n\n" +
-			"Example: keep pushing an active session to a fresh collection\n" +
-			"  pancakestack seestar sync \"M 81_sub\" m81-aug23\n\n" +
+			"Example: start a fresh session, skip anything already on disk\n" +
+			"  pancakestack seestar sync \"M 81_sub\" m81-aug23 --from-now\n\n" +
 			"Auto-stack once 50 frames land:\n" +
-			"  pancakestack seestar sync \"M 81_sub\" m81-aug23 \\\n" +
+			"  pancakestack seestar sync \"M 81_sub\" m81-aug23 --from-now \\\n" +
 			"    --stack-when 50 --stack-script seestar-advanced",
 		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -282,6 +289,10 @@ func newSeestarSyncCmd() *cobra.Command {
 				cancel()
 			}()
 
+			if fromNow && backfill {
+				return fmt.Errorf("--from-now and --backfill are mutually exclusive")
+			}
+
 			return seestar.Run(runCtx, seestar.SyncOptions{
 				Device:        device,
 				KeyPath:       seestar.DefaultKeyPath(),
@@ -294,6 +305,8 @@ func newSeestarSyncCmd() *cobra.Command {
 				StackParams:   params,
 				Client:        client,
 				State:         state,
+				FromNow:       fromNow,
+				Backfill:      backfill,
 				Log:           func(f string, a ...any) { fmt.Fprintf(os.Stderr, f, a...) },
 			})
 		},
@@ -305,6 +318,8 @@ func newSeestarSyncCmd() *cobra.Command {
 	c.Flags().IntVar(&stackWhen, "stack-when", 0, "Auto-launch a stack once this many NEW files have been uploaded (0 = never).")
 	c.Flags().StringVar(&stackScript, "stack-script", "", "Catalog script id for the auto-stack (e.g. seestar, seestar-advanced).")
 	c.Flags().StringSliceVar(&stackParams, "stack-param", nil, "Repeatable. key=value passed to the auto-stack.")
+	c.Flags().BoolVar(&fromNow, "from-now", false, "First-run only: baseline every file currently on the scope as already-uploaded and only sync frames captured afterwards.")
+	c.Flags().BoolVar(&backfill, "backfill", false, "First-run only: upload every file already on the scope in this folder.")
 	return c
 }
 
