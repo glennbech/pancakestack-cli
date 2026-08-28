@@ -133,6 +133,25 @@ func Run(ctx context.Context, opts SyncOptions) error {
 		opts.Log("· baseline: marked %d existing file(s) as already-seen (--from-now)\n", n)
 	}
 
+	// Reconcile local state against the collection's current contents.
+	// The rule: once a file lands in a collection, we never re-upload
+	// it — even if the user later deletes it during QA. Local state
+	// enforces that going forward, but a fresh install (or a sync
+	// session whose Mark was lost to a crash) has gaps: files that
+	// reached the backend but never made it into state, so the loop
+	// treats them as new and re-uploads. Reconcile closes that hole
+	// by seeding state from the backend on every start-up. Best-effort:
+	// a failed reconcile logs quietly and the loop runs anyway (the
+	// user just may see one extra upload cycle before state converges).
+	if opts.Client != nil && opts.CollectionID != "" {
+		n, err := reconcileFromCollection(ctx, rpc, opts)
+		if err != nil {
+			opts.Log("· reconcile skipped: %v\n", err)
+		} else if n > 0 {
+			opts.Log("· reconcile: added %d already-in-collection file(s) to state\n", n)
+		}
+	}
+
 	// Heartbeat ticker — every 5s post the last-known scope listing
 	// snapshot to the backend so the webapp can render the "Live import"
 	// banner. Best-effort: a failed heartbeat logs quietly and the loop
@@ -350,6 +369,67 @@ func runHeartbeat(
 			beat()
 		}
 	}
+}
+
+// reconcileFromCollection cross-references the target collection's
+// current contents against what the scope currently holds in the sync
+// folder. For every filename present in both, seed a local state
+// entry so future polls skip it — ensures files uploaded via other
+// channels (webapp uploads, another machine, a prior sync session
+// whose state was lost) are treated as already-seen, so a QA-delete
+// on the webapp doesn't cause the deleted file to churn back in.
+//
+// Match is by filename only: Seestar filenames encode target + exposure
+// + filter + UTC timestamp, so identical names are effectively identical
+// files. The stored size is the SCOPE's reported size (SizeK*1024),
+// not the backend's exact-byte SizeBytes, so state.Has() on future
+// polls always matches (they compare the same rounded value).
+func reconcileFromCollection(ctx context.Context, rpc *Client, opts SyncOptions) (int, error) {
+	collectionFiles, err := opts.Client.ListCollectionFiles(ctx, opts.CollectionID)
+	if err != nil {
+		return 0, err
+	}
+	if len(collectionFiles) == 0 {
+		return 0, nil
+	}
+	inCollection := make(map[string]struct{}, len(collectionFiles))
+	for _, f := range collectionFiles {
+		if f.Name != "" {
+			inCollection[f.Name] = struct{}{}
+		}
+	}
+	scopeFiles, err := rpc.ListFiles(ctx, opts.Folder)
+	if err != nil {
+		return 0, err
+	}
+	now := time.Now().UTC()
+	entries := make([]SyncEntry, 0, len(scopeFiles))
+	for _, sf := range scopeFiles {
+		if sf.Size == 0 {
+			continue
+		}
+		if _, ok := inCollection[sf.Name]; !ok {
+			continue
+		}
+		if opts.State.Has(opts.Folder, sf.Name, sf.Size) {
+			continue
+		}
+		entries = append(entries, SyncEntry{
+			Serial:     opts.Device.Serial,
+			Folder:     opts.Folder,
+			Filename:   sf.Name,
+			Size:       sf.Size,
+			Collection: opts.CollectionID,
+			UploadedAt: now,
+		})
+	}
+	if len(entries) == 0 {
+		return 0, nil
+	}
+	if err := opts.State.MarkBatch(entries); err != nil {
+		return 0, err
+	}
+	return len(entries), nil
 }
 
 // baselineExisting lists the folder once and records every current

@@ -190,6 +190,13 @@ swapping scopes (S30 → S50p, firmware reflash, etc.) keeps
 deduplication working. A pre-2.0 state file with serial-in-key
 entries is migrated in place on first load.
 
+On sync start the CLI also reconciles local state against the target
+collection's current contents: any file already in the collection is
+recorded as already-uploaded, so a QA-delete on the webapp never
+causes the file to churn back in on the next sync. Files deleted
+BEFORE this feature existed will re-upload once, then stay deleted
+after the next QA pass.
+
 While `seestar sync` is running, the webapp's collection detail page
 shows a green **"Live import in progress"** banner — heartbeated by
 the CLI every few seconds and cleared automatically when the process
