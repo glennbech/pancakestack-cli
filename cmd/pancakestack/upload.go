@@ -56,7 +56,7 @@ func newUploadCmd() *cobra.Command {
 	c := &cobra.Command{
 		Use:   "upload <collection-id> <path>...",
 		Short: "Upload FITS files (or an archive) to a named collection",
-		Long: "Uploads N individual files, or a single tar/zip archive, to a\n" +
+		Long: "Uploads N individual files, or a single tar/zip/rar archive, to a\n" +
 			"named collection.\n\n" +
 			"Modes:\n" +
 			"  pancakestack upload m101 *.fits           # multi-file: one object per file\n" +
@@ -109,7 +109,7 @@ func runMultiFileUpload(ctx context.Context, client *api.Client, collectionID st
 			return fmt.Errorf("stat %s: %w", p, err)
 		}
 		if info.IsDir() {
-			return fmt.Errorf("%s is a directory — pass individual files, or a single tar/zip", p)
+			return fmt.Errorf("%s is a directory — pass individual files, or a single tar/zip/rar", p)
 		}
 		base := filepath.Base(p)
 		if prev, ok := seen[base]; ok {
@@ -291,7 +291,7 @@ func runArchiveUpload(ctx context.Context, client *api.Client, collectionID, pat
 	if err != nil {
 		return err
 	}
-	isPreBuilt := isTarOrZipFile(path)
+	isPreBuilt := isArchiveFile(path)
 	if isPreBuilt {
 		fmt.Fprintf(os.Stderr, "Using existing archive: %s (%.1f MB)\n", path, mib(src.TotalSize))
 	} else {
@@ -395,7 +395,7 @@ func tarToTempFile(dir string) (*os.File, error) {
 	return f, nil
 }
 
-func isTarOrZipFile(path string) bool {
+func isArchiveFile(path string) bool {
 	info, err := os.Stat(path)
 	if err != nil || info.IsDir() {
 		return false
@@ -405,7 +405,8 @@ func isTarOrZipFile(path string) bool {
 		strings.HasSuffix(l, ".tar.gz") ||
 		strings.HasSuffix(l, ".tgz") ||
 		strings.HasSuffix(l, ".tar.zst") ||
-		strings.HasSuffix(l, ".zip")
+		strings.HasSuffix(l, ".zip") ||
+		strings.HasSuffix(l, ".rar")
 }
 
 func validCollectionID(s string) bool {

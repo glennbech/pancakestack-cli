@@ -88,7 +88,7 @@ Auth tokens live in `~/.config/pancakestack/credentials.json` (mode 0600).
 | `pancakestack login` | Open browser, sign in with Google, save tokens |
 | `pancakestack whoami` | Print the signed-in user |
 | `pancakestack logout` | Delete stored tokens |
-| `pancakestack upload <collection> <path>...` | Upload FITS files (or a tar/zip archive) to a collection |
+| `pancakestack upload <collection> <path>...` | Upload FITS files (or a tar/zip/rar archive) to a collection |
 | `pancakestack download <collection> [dest]` | Download every file in a collection, resumable |
 | `pancakestack stack <collection>` | Kick off a stack on a previously-uploaded collection |
 | `pancakestack jobs [job-id]` | List your jobs, or show details for one |
@@ -108,7 +108,7 @@ Run `pancakestack <command> --help` for the full flag list on any of them.
 # Multi-file — one S3 object per FITS, per-file dedup and resume:
 pancakestack upload m81 ~/astro/m81/lights/*.fit
 
-# Single archive — you already have a tar/zip:
+# Single archive — you already have a tar/zip/rar:
 pancakestack upload m81 lights.tar.zst
 
 # Directory — tars locally, uploads once:
