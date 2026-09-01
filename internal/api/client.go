@@ -1027,6 +1027,16 @@ func (c *Client) UploadFileMultipart(ctx context.Context, opts MultipartUploadOp
 	if partSize <= 0 {
 		return nil, fmt.Errorf("backend returned zero partSize")
 	}
+	// S3 caps a multipart upload at 10 000 parts. If the backend's suggested
+	// partSize would blow past that for this file, round it up so total ≤ 10 000.
+	// Without this the CLI happily asks the backend to sign part 10 001 and
+	// gets a 400 partNumber-out-of-range.
+	const maxParts = 10000
+	if (opts.Size+partSize-1)/partSize > maxParts {
+		const mib = 1024 * 1024
+		needed := (opts.Size + maxParts - 1) / maxParts
+		partSize = ((needed + mib - 1) / mib) * mib
+	}
 	total := int((opts.Size + partSize - 1) / partSize)
 	concurrency := opts.Concurrency
 	if concurrency < 1 {
