@@ -54,6 +54,7 @@ func archiveNameFor(sourcePath, collectionID string, isPreBuilt bool) string {
 func newUploadCmd() *cobra.Command {
 	var concurrency int
 	var noResume bool
+	var resumeUploadID, resumeKey string
 	c := &cobra.Command{
 		Use:   "upload <collection-id> <path>...",
 		Short: "Upload FITS files (or an archive) to a named collection",
@@ -69,6 +70,10 @@ func newUploadCmd() *cobra.Command {
 			"Archive uploads (.tar/.zip/.rar) auto-resume if a previous run died\n" +
 			"mid-upload — on re-invocation with the same file, only the missing\n" +
 			"parts are re-sent. Pass --no-resume to force a fresh start.\n\n" +
+			"Manual recovery (rare) — for a prior upload whose local state was\n" +
+			"lost or predates the auto-resume feature, pass both --resume-upload-id\n" +
+			"and --resume-key (from the failed upload's error message) to skip\n" +
+			"init and pick up where S3 left off.\n\n" +
 			"To archive a collection to cold storage after upload:\n" +
 			"  pancakestack archive <collection-id>",
 		Args: cobra.MinimumNArgs(2),
@@ -86,6 +91,27 @@ func newUploadCmd() *cobra.Command {
 				return err
 			}
 
+			// Manual-resume mode: seed local state from provided uploadID+key
+			// so the normal archive-upload path finds it and takes the
+			// resume branch. Requires archive mode (single .rar/.tar/.zip
+			// path) — multi-file uploads don't use multipart.
+			if resumeUploadID != "" || resumeKey != "" {
+				if resumeUploadID == "" || resumeKey == "" {
+					return fmt.Errorf("--resume-upload-id and --resume-key must both be set (extract from the failed upload's error message)")
+				}
+				if len(paths) != 1 || !isArchiveFile(paths[0]) {
+					return fmt.Errorf("--resume-upload-id/--resume-key require a single archive path (.tar/.zip/.rar) — multipart doesn't apply to per-file uploads")
+				}
+				if noResume {
+					return fmt.Errorf("--no-resume conflicts with --resume-upload-id/--resume-key")
+				}
+				if err := seedManualResumeState(paths[0], collectionID, resumeUploadID, resumeKey); err != nil {
+					return fmt.Errorf("seed manual resume state: %w", err)
+				}
+				// Fall through to runArchiveUpload — the state we just
+				// wrote will be picked up by the normal resume detection.
+			}
+
 			// Multi-file mode: >1 path, OR one path that isn't a dir/archive.
 			// Single-path-that-is-dir stays on the tar-and-multipart route
 			// because we can't sensibly present N-thousand file uploads
@@ -100,7 +126,59 @@ func newUploadCmd() *cobra.Command {
 		"Max concurrent uploads during multi-file mode. Higher = faster on fibre, slower on flaky links.")
 	c.Flags().BoolVar(&noResume, "no-resume", false,
 		"Force a fresh multipart upload for archive mode, ignoring any saved resume state.")
+	c.Flags().StringVar(&resumeUploadID, "resume-upload-id", "",
+		"S3 multipart uploadId to resume against — extract from a prior failed upload's error message. Must be paired with --resume-key.")
+	c.Flags().StringVar(&resumeKey, "resume-key", "",
+		"S3 object key (URL-decoded, e.g. \"input/<sub>/<collectionId>/<filename>\") to resume against. Must be paired with --resume-upload-id.")
 	return c
+}
+
+// seedManualResumeState writes a local UploadState file synthesised from
+// the given uploadID + key + the current local file's stat. Used when a
+// prior upload's state was lost (or predates the resume feature) and the
+// user has extracted the uploadID + key from the failed error message.
+//
+// PartSize is left zero — initOrResume derives it on the fly from the
+// max size across parts S3 has stored, so we don't need the user to
+// remember it.
+func seedManualResumeState(path, collectionID, uploadID, key string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("stat %s: %w", path, err)
+	}
+	if info.IsDir() {
+		return fmt.Errorf("%s is a directory — manual resume only makes sense for a single archive file", path)
+	}
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return fmt.Errorf("abs path %s: %w", path, err)
+	}
+	filename := archiveNameFor(path, collectionID, true)
+	// Sanity gate: the derived filename should be the last segment of
+	// the S3 key. If not, the user probably passed a wrong file or wrong
+	// key — refuse rather than seed a state that will fail at Complete.
+	// Belt-and-suspenders: strip trailing slash before split.
+	if lastSlash := strings.LastIndex(strings.TrimSuffix(key, "/"), "/"); lastSlash >= 0 {
+		keyFilename := key[lastSlash+1:]
+		if keyFilename != filename {
+			return fmt.Errorf("filename mismatch: local file basename is %q but --resume-key ends in %q — verify you passed the same file the failed upload was for (and that --resume-key is URL-decoded)",
+				filename, keyFilename)
+		}
+	}
+	fmt.Fprintf(os.Stderr, "Seeding manual resume state for %s (%.1f MB)\n  uploadId: %s\n  key: %s\n",
+		filename, mib(info.Size()), uploadID, key)
+	return api.SaveUploadState(&api.UploadState{
+		CollectionID:  collectionID,
+		Filename:      filename,
+		AbsPath:       absPath,
+		Size:          info.Size(),
+		MTimeUnixNano: info.ModTime().UnixNano(),
+		UploadID:      uploadID,
+		Key:           key,
+		PartSize:      0, // Derived from ListParts response at resume time.
+		ContentType:   "application/octet-stream",
+		CreatedAt:     time.Now().UTC(),
+	})
 }
 
 // runMultiFileUpload handles N individual files. Backend preserves each

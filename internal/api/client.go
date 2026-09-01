@@ -1237,9 +1237,31 @@ func (c *Client) initOrResume(ctx context.Context, opts MultipartUploadOptions, 
 			saved = nil
 		}
 		if saved != nil {
-			parts, _, listErr := c.ListMultipartParts(ctx, saved.UploadID, saved.Key)
+			parts, returnedPartSize, listErr := c.ListMultipartParts(ctx, saved.UploadID, saved.Key)
 			if listErr == nil {
-				return saved.UploadID, saved.Key, int64(saved.PartSize), parts, nil
+				// Priority for partSize:
+				//   1. Any uploaded part's actual size (max) — authoritative,
+				//      matches what S3 stored + what the original CLI signed
+				//      against. Handles the manual-resume case where saved
+				//      PartSize is zero because the user seeded state from
+				//      just an uploadID + key.
+				//   2. saved.PartSize — what we told S3 originally on the
+				//      first CLI run.
+				//   3. Backend's returned partSize — fallback for the
+				//      never-uploaded-a-part-yet case.
+				partSize := int64(returnedPartSize)
+				if saved.PartSize > 0 {
+					partSize = int64(saved.PartSize)
+				}
+				for _, p := range parts {
+					if p.Size > partSize {
+						partSize = p.Size
+					}
+				}
+				if partSize <= 0 {
+					return "", "", 0, nil, fmt.Errorf("resume: could not determine partSize (empty state, empty S3, empty backend response)")
+				}
+				return saved.UploadID, saved.Key, partSize, parts, nil
 			}
 			if errors.Is(listErr, ErrNoSuchUpload) {
 				// S3 aborted or expired the multipart. Drop stale state
