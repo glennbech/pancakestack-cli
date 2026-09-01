@@ -127,6 +127,46 @@ func (c *Client) SignMultipartPart(ctx context.Context, uploadID, key string, pa
 type CompletedPart struct {
 	PartNumber int    `json:"partNumber"`
 	ETag       string `json:"etag"`
+	// Size is only populated on results from ListMultipartParts —
+	// UploadFileMultipart uses it to fast-forward the progress bar so
+	// a resume doesn't display "0 MiB" while it silently accounts for
+	// gigabytes S3 already has.
+	Size int64 `json:"size,omitempty"`
+}
+
+// ErrNoSuchUpload is returned by ListMultipartParts when the backend
+// reports the multipart upload no longer exists (aborted, or bucket
+// lifecycle expired it). Callers should drop any local state file
+// referencing this uploadId and re-init instead of retrying.
+var ErrNoSuchUpload = errors.New("multipart upload no longer exists on S3")
+
+type multipartListPartsReq struct {
+	UploadID string `json:"uploadId"`
+	Key      string `json:"key"`
+}
+type multipartListPartsResp struct {
+	Parts    []CompletedPart `json:"parts"`
+	PartSize int             `json:"partSize"`
+}
+
+// ListMultipartParts asks the backend which parts S3 has already stored
+// for an in-flight upload. Powers the CLI's auto-resume: on a re-run,
+// we skip re-uploading anything ListParts reports, then complete with
+// the merged set of new + existing parts.
+//
+// Returns ErrNoSuchUpload when the backend reports 404 (the multipart
+// was aborted or S3 lifecycle expired it). Callers should treat that as
+// "throw away the state file and start over" rather than a retryable error.
+func (c *Client) ListMultipartParts(ctx context.Context, uploadID, key string) ([]CompletedPart, int, error) {
+	var resp multipartListPartsResp
+	body := multipartListPartsReq{UploadID: uploadID, Key: key}
+	if err := c.postJSON(ctx, "/upload/list-parts", body, &resp); err != nil {
+		if strings.Contains(err.Error(), "NO_SUCH_UPLOAD") || strings.Contains(err.Error(), "returned 404") {
+			return nil, 0, ErrNoSuchUpload
+		}
+		return nil, 0, err
+	}
+	return resp.Parts, resp.PartSize, nil
 }
 
 type multipartCompleteReq struct {
@@ -992,11 +1032,36 @@ type MultipartUploadOptions struct {
 	Concurrency int
 	// OnProgress fires whenever a part finishes; may be called from many goroutines.
 	OnProgress func(uploadedBytes, totalBytes int64)
+
+	// Resume plumbing. When AbsPath + MTimeUnixNano are both set we
+	// persist a state file on init and, on the next invocation for the
+	// same (collection, filename, path, size, mtime) tuple, call
+	// ListMultipartParts to skip re-uploading anything S3 already has.
+	// Leave both zero to disable resume (small files, ephemeral data,
+	// tests) — the upload works exactly as before.
+	AbsPath       string
+	MTimeUnixNano int64
+	// NoResume forces a fresh multipart even when saved state exists.
+	// Rare escape hatch: only useful when a user knows the local file
+	// changed underneath our size/mtime check (e.g. same size after an
+	// edit, filesystem with 1s mtime granularity).
+	NoResume bool
+	// OnResume fires once before uploading if we're picking up where a
+	// prior invocation left off. Lets the caller print a "resuming from
+	// part X/Y (Z MiB already on S3)" message without teaching the api
+	// package about stderr formatting.
+	OnResume func(alreadyDoneParts, totalParts int, alreadyDoneBytes int64)
 }
 
 // UploadFileMultipart orchestrates init → parallel part PUTs → complete for a
 // seekable data source. Required for anything above the S3 5 GiB single-PUT
 // ceiling; safe (if slightly chattier) for small files too.
+//
+// Auto-resume: if opts.AbsPath and opts.MTimeUnixNano are set, we persist
+// the {uploadID, key, partSize} tuple to disk after init. A subsequent
+// call with the same file (same collection, filename, path, size, mtime)
+// re-uses the multipart upload — asks the backend which parts S3 already
+// has, only re-sends the missing ones, and completes with the merged set.
 func (c *Client) UploadFileMultipart(ctx context.Context, opts MultipartUploadOptions) (*MultipartCompleteResp, error) {
 	if opts.Data == nil {
 		return nil, fmt.Errorf("Data required")
@@ -1008,35 +1073,21 @@ func (c *Client) UploadFileMultipart(ctx context.Context, opts MultipartUploadOp
 	if contentType == "" {
 		contentType = "application/octet-stream"
 	}
-	init, err := c.InitMultipartUpload(ctx, opts.CollectionID, opts.Filename, contentType, opts.SHA256, opts.Size)
+
+	uploadID, key, partSize, existing, err := c.initOrResume(ctx, opts, contentType)
 	if err != nil {
 		return nil, err
 	}
-	if init.Skipped {
-		// Duplicate rejected before we started streaming — surface
-		// as a MultipartCompleteResp with zero size and the duplicate
-		// details in Key. Caller checks Skipped-shape by looking at
-		// SizeBytes == 0 && Key == "" and the returned resp fields.
+	// Duplicate-shortcut path: initOrResume returned zeroes + a synthesized
+	// skipped response is delivered via the sentinel key "__skipped__".
+	if key == "__skipped__" {
 		return &MultipartCompleteResp{
 			Skipped:     true,
-			Reason:      init.Reason,
-			DuplicateOf: init.DuplicateOf,
+			Reason:      existing[0].ETag, // reused as reason carrier
+			DuplicateOf: existing[1].ETag,
 		}, nil
 	}
-	partSize := int64(init.PartSize)
-	if partSize <= 0 {
-		return nil, fmt.Errorf("backend returned zero partSize")
-	}
-	// S3 caps a multipart upload at 10 000 parts. If the backend's suggested
-	// partSize would blow past that for this file, round it up so total ≤ 10 000.
-	// Without this the CLI happily asks the backend to sign part 10 001 and
-	// gets a 400 partNumber-out-of-range.
-	const maxParts = 10000
-	if (opts.Size+partSize-1)/partSize > maxParts {
-		const mib = 1024 * 1024
-		needed := (opts.Size + maxParts - 1) / maxParts
-		partSize = ((needed + mib - 1) / mib) * mib
-	}
+
 	total := int((opts.Size + partSize - 1) / partSize)
 	concurrency := opts.Concurrency
 	if concurrency < 1 {
@@ -1046,12 +1097,55 @@ func (c *Client) UploadFileMultipart(ctx context.Context, opts MultipartUploadOp
 		concurrency = total
 	}
 
+	// Seed the completed slots from anything ListMultipartParts told us
+	// S3 already had, and skip those partNumbers when enqueueing work.
+	// Also pre-credit their bytes to the progress bar so a mostly-done
+	// resume doesn't render "0.0 MiB" for a minute while the missing
+	// tail streams up.
 	completed := make([]CompletedPart, total)
 	var uploadedBytes int64
+	alreadyDone := make(map[int]bool, len(existing))
+	var resumedBytes int64
+	for _, p := range existing {
+		if p.PartNumber < 1 || p.PartNumber > total {
+			// S3 has a part we don't recognise. Safer to abort than to
+			// complete with a mystery part — could indicate the local
+			// file changed size after we started but before our size+mtime
+			// check would have caught it. Force a fresh upload.
+			return nil, fmt.Errorf("resume: S3 reports part %d but this file only has %d parts — start over with --no-resume", p.PartNumber, total)
+		}
+		completed[p.PartNumber-1] = CompletedPart{PartNumber: p.PartNumber, ETag: p.ETag}
+		alreadyDone[p.PartNumber] = true
+		resumedBytes += p.Size
+	}
+	if resumedBytes > 0 {
+		uploadedBytes = resumedBytes
+		if opts.OnResume != nil {
+			opts.OnResume(len(existing), total, resumedBytes)
+		}
+		if opts.OnProgress != nil {
+			opts.OnProgress(resumedBytes, opts.Size)
+		}
+	}
 
-	partCh := make(chan int, total)
+	pending := total - len(alreadyDone)
+	if pending == 0 {
+		// Everything's on S3 already — user re-ran after the process died
+		// between the last part upload and CompleteMultipartUpload.
+		// Just complete.
+		resp, err := c.CompleteMultipartUpload(ctx, uploadID, key, completed)
+		if err != nil {
+			return nil, err
+		}
+		c.clearUploadState(opts)
+		return resp, nil
+	}
+
+	partCh := make(chan int, pending)
 	for i := 1; i <= total; i++ {
-		partCh <- i
+		if !alreadyDone[i] {
+			partCh <- i
+		}
 	}
 	close(partCh)
 
@@ -1069,6 +1163,9 @@ func (c *Client) UploadFileMultipart(ctx context.Context, opts MultipartUploadOp
 			cancel()
 		})
 	}
+	if concurrency > pending {
+		concurrency = pending
+	}
 	for w := 0; w < concurrency; w++ {
 		wg.Add(1)
 		go func() {
@@ -1082,7 +1179,7 @@ func (c *Client) UploadFileMultipart(ctx context.Context, opts MultipartUploadOp
 				if offset+length > opts.Size {
 					length = opts.Size - offset
 				}
-				url, err := c.SignMultipartPart(ctx, init.UploadID, init.Key, partNumber)
+				url, err := c.SignMultipartPart(ctx, uploadID, key, partNumber)
 				if err != nil {
 					fail(fmt.Errorf("sign part %d: %w", partNumber, err))
 					return
@@ -1106,33 +1203,215 @@ func (c *Client) UploadFileMultipart(ctx context.Context, opts MultipartUploadOp
 		return nil, firstEr
 	}
 
-	return c.CompleteMultipartUpload(ctx, init.UploadID, init.Key, completed)
+	resp, err := c.CompleteMultipartUpload(ctx, uploadID, key, completed)
+	if err != nil {
+		return nil, err
+	}
+	c.clearUploadState(opts)
+	return resp, nil
 }
+
+// initOrResume returns the multipart upload we should use for this
+// upload attempt — either a fresh one from /upload/init or the existing
+// one recorded in a state file on disk. Return shape:
+//
+//	uploadID, key, partSize — always valid for the caller to stream against.
+//	existing               — parts S3 already has (empty for a fresh upload).
+//	err                    — surfaced verbatim.
+//
+// Special case: if /upload/init returns Skipped=true (duplicate), we
+// return the sentinel key "__skipped__" and stash reason/duplicateOf in
+// the first two elements of `existing`. Ugly but avoids a second return
+// path muddying the main flow.
+func (c *Client) initOrResume(ctx context.Context, opts MultipartUploadOptions, contentType string) (string, string, int64, []CompletedPart, error) {
+	// Resume path — only when the caller told us where the file lives.
+	// Without AbsPath + MTimeUnixNano we can't safely key state, so we
+	// don't try.
+	if !opts.NoResume && opts.AbsPath != "" && opts.MTimeUnixNano != 0 {
+		saved, err := LoadUploadState(opts.CollectionID, opts.Filename, opts.AbsPath, opts.Size, opts.MTimeUnixNano)
+		if err != nil {
+			// Corrupt state file. Delete and start fresh rather than
+			// halting — the alternative is a permanent wedge on this
+			// specific file until the user manually rms the state.
+			_ = DeleteUploadState(opts.CollectionID, opts.Filename, opts.AbsPath, opts.Size, opts.MTimeUnixNano)
+			saved = nil
+		}
+		if saved != nil {
+			parts, _, listErr := c.ListMultipartParts(ctx, saved.UploadID, saved.Key)
+			if listErr == nil {
+				return saved.UploadID, saved.Key, int64(saved.PartSize), parts, nil
+			}
+			if errors.Is(listErr, ErrNoSuchUpload) {
+				// S3 aborted or expired the multipart. Drop stale state
+				// and fall through to fresh init.
+				_ = DeleteUploadState(opts.CollectionID, opts.Filename, opts.AbsPath, opts.Size, opts.MTimeUnixNano)
+			} else {
+				// Some other error (auth, network, backend down). Don't
+				// silently start a fresh 100-GB upload — surface the
+				// error so the user can retry.
+				return "", "", 0, nil, fmt.Errorf("resume: list parts: %w", listErr)
+			}
+		}
+	}
+
+	// Fresh init.
+	init, err := c.InitMultipartUpload(ctx, opts.CollectionID, opts.Filename, contentType, opts.SHA256, opts.Size)
+	if err != nil {
+		return "", "", 0, nil, err
+	}
+	if init.Skipped {
+		return "", "__skipped__", 0, []CompletedPart{
+			{ETag: init.Reason},
+			{ETag: init.DuplicateOf},
+		}, nil
+	}
+	partSize := int64(init.PartSize)
+	if partSize <= 0 {
+		return "", "", 0, nil, fmt.Errorf("backend returned zero partSize")
+	}
+	// S3 caps a multipart upload at 10 000 parts. If the backend's suggested
+	// partSize would blow past that for this file, round it up so total ≤ 10 000.
+	// Without this the CLI happily asks the backend to sign part 10 001 and
+	// gets a 400 partNumber-out-of-range.
+	const maxParts = 10000
+	if (opts.Size+partSize-1)/partSize > maxParts {
+		const mib = 1024 * 1024
+		needed := (opts.Size + maxParts - 1) / maxParts
+		partSize = ((needed + mib - 1) / mib) * mib
+	}
+
+	// Persist state so a crash between here and Complete leaves us with
+	// something to resume from. Best-effort — a write failure shouldn't
+	// abort the upload; worst case we lose resume for this one file.
+	if opts.AbsPath != "" && opts.MTimeUnixNano != 0 {
+		_ = SaveUploadState(&UploadState{
+			CollectionID:  opts.CollectionID,
+			Filename:      opts.Filename,
+			AbsPath:       opts.AbsPath,
+			Size:          opts.Size,
+			MTimeUnixNano: opts.MTimeUnixNano,
+			UploadID:      init.UploadID,
+			Key:           init.Key,
+			PartSize:      int(partSize),
+			ContentType:   contentType,
+			CreatedAt:     time.Now().UTC(),
+		})
+	}
+
+	return init.UploadID, init.Key, partSize, nil, nil
+}
+
+// clearUploadState best-effort removes the state file after a successful
+// complete. Never propagates errors — losing the state file just means
+// the next upload of a different file uses one more inode.
+func (c *Client) clearUploadState(opts MultipartUploadOptions) {
+	if opts.AbsPath == "" || opts.MTimeUnixNano == 0 {
+		return
+	}
+	_ = DeleteUploadState(opts.CollectionID, opts.Filename, opts.AbsPath, opts.Size, opts.MTimeUnixNano)
+}
+
+// partUploadMaxAttempts is the total number of times we'll PUT a single
+// part before giving up. Set high enough that a residential connection
+// dropping mid-upload of one 8 MiB part doesn't kill an 8-hour, 10,000-part
+// job — a single broken pipe used to nuke the whole upload (see the
+// 2026-09-01 Lobster Nebula incident, 8128 parts in). Not infinite: at
+// some point the presigned URL expires (1h backend-side) and the caller
+// needs a real error, not a hang.
+const partUploadMaxAttempts = 6
 
 // putPresignedPart PUTs a single part and returns the ETag with quotes stripped.
 // The URL already carries SigV4 auth in its query string, so we send no
-// headers beyond Content-Length.
-func putPresignedPart(ctx context.Context, presignedURL string, body io.Reader, length int64) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, presignedURL, body)
-	if err != nil {
-		return "", err
-	}
-	req.ContentLength = length
+// headers beyond Content-Length. Body must be seekable — we rewind to 0
+// before each attempt so retries send the same bytes, not a drained reader.
+func putPresignedPart(ctx context.Context, presignedURL string, body io.ReadSeeker, length int64) (string, error) {
 	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("PUT to S3: %w", err)
+	var lastErr error
+	for attempt := 1; attempt <= partUploadMaxAttempts; attempt++ {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		if _, err := body.Seek(0, io.SeekStart); err != nil {
+			return "", fmt.Errorf("rewind part body: %w", err)
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPut, presignedURL, body)
+		if err != nil {
+			return "", err
+		}
+		req.ContentLength = length
+		resp, err := client.Do(req)
+		if err != nil {
+			// Transport-level error — broken pipe, connection reset,
+			// DNS blip. Always retryable unless the ctx is done.
+			lastErr = fmt.Errorf("PUT to S3: %w", err)
+			if !sleepBackoff(ctx, attempt) {
+				return "", lastErr
+			}
+			continue
+		}
+		if resp.StatusCode >= 300 {
+			b, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			lastErr = fmt.Errorf("S3 returned %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+			// 5xx / 408 / 429 are retryable; other 4xx are the caller's
+			// fault (bad signature, expired URL, wrong length) — no point
+			// hammering S3.
+			if !isRetryableStatus(resp.StatusCode) {
+				return "", lastErr
+			}
+			if !sleepBackoff(ctx, attempt) {
+				return "", lastErr
+			}
+			continue
+		}
+		etag := resp.Header.Get("ETag")
+		resp.Body.Close()
+		if etag == "" {
+			return "", fmt.Errorf("S3 did not return an ETag")
+		}
+		return strings.Trim(etag, `"`), nil
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("S3 returned %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+	return "", lastErr
+}
+
+// isRetryableStatus returns true for HTTP statuses where the same request
+// might succeed on retry. 5xx = server hiccup. 408 = timeout, request never
+// really landed. 429 = told to slow down. Everything else in 4xx is a bug
+// in the request (bad sig, wrong length, expired URL) — retrying won't help.
+func isRetryableStatus(code int) bool {
+	if code >= 500 {
+		return true
 	}
-	etag := resp.Header.Get("ETag")
-	if etag == "" {
-		return "", fmt.Errorf("S3 did not return an ETag")
+	return code == http.StatusRequestTimeout || code == http.StatusTooManyRequests
+}
+
+// sleepBackoff waits for attempt N's backoff (1s, 2s, 4s, 8s, 16s, capped
+// at 30s) with ±25% jitter to avoid thundering-herd retries when a shared
+// upstream (S3 partition, home router) drops many parallel workers at
+// once. Returns false if ctx completes during the sleep; true otherwise
+// so the caller keeps looping. Doesn't sleep after the final attempt —
+// the caller checks the loop counter.
+func sleepBackoff(ctx context.Context, attempt int) bool {
+	if attempt >= partUploadMaxAttempts {
+		return false
 	}
-	return strings.Trim(etag, `"`), nil
+	base := time.Duration(1<<uint(attempt-1)) * time.Second
+	if base > 30*time.Second {
+		base = 30 * time.Second
+	}
+	// Deterministic jitter — attempt count as the only seed input keeps
+	// this testable without hauling in math/rand. Range is base*[0.75, 1.25].
+	jitter := time.Duration(int64(base) * int64(attempt*7%50-25) / 100)
+	d := base + jitter
+	if d < 100*time.Millisecond {
+		d = 100 * time.Millisecond
+	}
+	select {
+	case <-time.After(d):
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // ---- Bulk download presign ----

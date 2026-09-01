@@ -53,6 +53,7 @@ func archiveNameFor(sourcePath, collectionID string, isPreBuilt bool) string {
 
 func newUploadCmd() *cobra.Command {
 	var concurrency int
+	var noResume bool
 	c := &cobra.Command{
 		Use:   "upload <collection-id> <path>...",
 		Short: "Upload FITS files (or an archive) to a named collection",
@@ -65,6 +66,9 @@ func newUploadCmd() *cobra.Command {
 			"Under the FITS-primary storage model, individual FITS uploads are the\n" +
 			"recommended path — no local tar step, per-file retry, resumable across\n" +
 			"crashes (files already uploaded skip on re-run).\n\n" +
+			"Archive uploads (.tar/.zip/.rar) auto-resume if a previous run died\n" +
+			"mid-upload — on re-invocation with the same file, only the missing\n" +
+			"parts are re-sent. Pass --no-resume to force a fresh start.\n\n" +
 			"To archive a collection to cold storage after upload:\n" +
 			"  pancakestack archive <collection-id>",
 		Args: cobra.MinimumNArgs(2),
@@ -89,11 +93,13 @@ func newUploadCmd() *cobra.Command {
 			if len(paths) > 1 || isFitsFile(paths[0]) {
 				return runMultiFileUpload(ctx, client, collectionID, paths, concurrency)
 			}
-			return runArchiveUpload(ctx, client, collectionID, paths[0])
+			return runArchiveUpload(ctx, client, collectionID, paths[0], noResume)
 		},
 	}
 	c.Flags().IntVar(&concurrency, "concurrency", 4,
 		"Max concurrent uploads during multi-file mode. Higher = faster on fibre, slower on flaky links.")
+	c.Flags().BoolVar(&noResume, "no-resume", false,
+		"Force a fresh multipart upload for archive mode, ignoring any saved resume state.")
 	return c
 }
 
@@ -286,7 +292,7 @@ func hashFile(path string) (string, error) {
 // runArchiveUpload is the legacy single-archive path — kept because a
 // user with an existing tar (or a directory to tar) shouldn't be forced
 // to expand it locally first.
-func runArchiveUpload(ctx context.Context, client *api.Client, collectionID, path string) error {
+func runArchiveUpload(ctx context.Context, client *api.Client, collectionID, path string, noResume bool) error {
 	src, err := archive.InspectSource(path)
 	if err != nil {
 		return err
@@ -303,6 +309,12 @@ func runArchiveUpload(ctx context.Context, client *api.Client, collectionID, pat
 
 	var data *os.File
 	var length int64
+	// absPath + mtime pin the resume state key. Only meaningful for the
+	// pre-built path — for the tar-on-the-fly path we'd get a fresh
+	// tempfile every invocation and resume wouldn't apply anyway (bytes
+	// re-tar to different offsets on each run).
+	var absPath string
+	var mtimeUnixNano int64
 	if isPreBuilt {
 		f, err := os.Open(path)
 		if err != nil {
@@ -311,6 +323,12 @@ func runArchiveUpload(ctx context.Context, client *api.Client, collectionID, pat
 		defer f.Close()
 		data = f
 		length = src.TotalSize
+		if abs, err := filepath.Abs(path); err == nil {
+			absPath = abs
+		}
+		if info, err := f.Stat(); err == nil {
+			mtimeUnixNano = info.ModTime().UnixNano()
+		}
 	} else {
 		tmp, err := tarToTempFile(path)
 		if err != nil {
@@ -333,11 +351,18 @@ func runArchiveUpload(ctx context.Context, client *api.Client, collectionID, pat
 	started := time.Now()
 	progress := newProgressPrinter(started)
 	done, err := client.UploadFileMultipart(ctx, api.MultipartUploadOptions{
-		CollectionID: collectionID,
-		Filename:     archiveName,
-		Data:         data,
-		Size:         length,
-		OnProgress:   progress.update,
+		CollectionID:  collectionID,
+		Filename:      archiveName,
+		Data:          data,
+		Size:          length,
+		AbsPath:       absPath,
+		MTimeUnixNano: mtimeUnixNano,
+		NoResume:      noResume,
+		OnResume: func(alreadyDone, total int, alreadyDoneBytes int64) {
+			fmt.Fprintf(os.Stderr, "↻ Resuming previous upload: %d/%d parts already on S3 (%.1f MB)\n",
+				alreadyDone, total, mib(alreadyDoneBytes))
+		},
+		OnProgress: progress.update,
 	})
 	if err != nil {
 		progress.finish()
