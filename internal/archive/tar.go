@@ -1,8 +1,8 @@
 // Package archive builds a tarball on the fly from a source directory or
-// file. Skips .DS_Store, __MACOSX/, and non-FITS AppleDouble sidecars
-// (._foo but NOT ._foo.fit) — a user with a legitimate FITS named with
-// a leading dot should still be able to upload it; only true macOS
-// resource-fork noise gets dropped.
+// file. Skips macOS AppleDouble junk (._foo, .DS_Store, __MACOSX/) so it
+// matches what the backend user-data already strips — otherwise the
+// backend silently drops the same files server-side and the user only
+// notices in the collection view.
 package archive
 
 import (
@@ -106,23 +106,7 @@ func TarDirTo(dir string, w io.Writer) error {
 }
 
 func isJunkFile(name string) bool {
-	if name == ".DS_Store" {
-		return true
-	}
-	if strings.HasPrefix(name, "._") {
-		// AppleDouble sidecars are typically resource-fork noise, but a
-		// user with a legit FITS name starting with `._` should still
-		// upload — accept the small risk of some real macOS junk making
-		// it through in exchange for not silently dropping user data.
-		lower := strings.ToLower(name)
-		if strings.HasSuffix(lower, ".fit") ||
-			strings.HasSuffix(lower, ".fits") ||
-			strings.HasSuffix(lower, ".fz") {
-			return false
-		}
-		return true
-	}
-	return false
+	return strings.HasPrefix(name, "._") || name == ".DS_Store"
 }
 
 func isJunkDir(name string) bool {
